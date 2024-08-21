@@ -1,0 +1,39 @@
+[package]
+name = "asciisub"
+version = "0.1.0"
+authors = ["Ryan Castellucci <code@ryanc.org>"]
+edition = "2021"
+resolver = "2"
+
+[dependencies]
+byteorder = "1"
+clap = { version = "4", features = ["derive"] }
+#dashmap = "6.0"
+format-bytes = "0.3"
+lazy_static = "1.5"
+palette = "0.7"
+rayon = "1.10"
+thiserror = "1.0"
+zstd = "0.13"
+#lru = "0"
+#bimap = "0"
+
+[build-dependencies]
+atomic-counter = "1.0"
+blake3 = "1.5"
+counter = "0.5"
+itertools = "0.13"
+rayon = "1.10"
+palette = "0.7"
+zstd = "0.13"
+
+# build.rs does expensive lookup table generation
+[profile.dev.build-override]
+opt-level = 3
+
+[profile.release.build-override]
+opt-level = 3
+
+[profile.lto]
+inherits = "release"
+lto = true
