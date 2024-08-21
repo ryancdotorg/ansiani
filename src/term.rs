@@ -1,10 +1,11 @@
 //use lru::LruCache;
 //use std::num::NonZeroUsize;
 
+use enumset::{enum_set, EnumSet, EnumSetType};
 //use format_bytes::{DisplayBytes, format_bytes, write_bytes};
 use format_bytes::write_bytes;
 use lazy_static::lazy_static;
-use std::io::{self, Write, BufReader};
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::str::Chars;
 
@@ -34,6 +35,10 @@ pub enum Error {
     ParseIntOverflow,
     #[error("parse failed, unexpected codepoint {codepoint} in state {state}")]
     ParseBadChar { state: u32, codepoint: u32 },
+    #[error("parse failed, unexpected code")]
+    ParseBadCode,
+    #[error("parse failed, truncated")]
+    ParseTruncated,
 }
 
 lazy_static! {
@@ -160,41 +165,9 @@ pub fn xterm256_nearest(r: u8, g: u8, b: u8) -> u8 {
 }
 
 
-pub fn parse_ansi(c: &mut Chars) -> Result<Option<(Vec<u8>, char)>, Error> {
-    let mut accum = 0u32;
-    let mut state = 0u32;
-    let mut numbers = Vec::<u8>::new();
-    loop {
-        if let Some(cc) = c.next() {
-            let v: u32 = state | u32::from(cc);
-            match v {
-                0..=26 | 28..=0x10ffff => {
-                    return Ok(Some((numbers, v.try_into().unwrap())));
-                },
-                0x1b => /* escape */ { state = 1 << 24; },
-                0x100005b => /* [ */ { state = 2 << 24; },
-                0x2000030..=0x2000039 => /* 0-9 */ {
-                    accum = accum * 10 + (v & 15u32);
-                    if accum > 255 { return Err(Error::ParseIntOverflow); }
-                },
-                0x200003b => /* ; */ { numbers.push(accum as u8); accum = 0; },
-                0x200006d => /* m */ { state = 0; },
-                _ => {
-                    return Err(Error::ParseBadChar{
-                        state: v >> 24,
-                        codepoint: v & 0xffffff
-                    });
-                },
-            }
-        } else {
-            return Ok(None);
-        }
-    }
-}
-
 #[allow(dead_code)]
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq)]
 pub struct Xterm256(u8);
 
 impl TryFrom<u8> for Xterm256 {
@@ -210,7 +183,7 @@ impl TryFrom<u8> for Xterm256 {
 
 #[repr(u8)]
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq)]
 pub enum Basic {
     Black = 0,
     Red,
@@ -256,6 +229,7 @@ impl TryFrom<u8> for Basic {
 }
 
 #[repr(u8)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq)]
 enum FgBg {
     Foreground = 30,
     Background = 40,
@@ -265,7 +239,7 @@ const FOREGROUND: FgBg = FgBg::Foreground;
 const BACKGROUND: FgBg = FgBg::Background;
 
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq)]
 pub enum TermColor {
     Rgb { r: u8, g: u8, b: u8, },
     Xterm256(Xterm256),
@@ -388,52 +362,7 @@ impl TermColor {
     */
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
-pub struct TermRgb {
-    pub r: u8,
-    pub g: u8,
-    pub b: u8,
-    index: Option<u8>,
-    lab: Option<Lab>,
-}
-
-#[allow(dead_code)]
-impl TermRgb {
-    pub fn new(r: u8, g: u8, b: u8) -> Self {
-        Self { r, g, b, index: None, lab: None }
-    }
-
-    pub fn from_components(rgb: (u8, u8, u8)) -> Self {
-        Self::new(rgb.0, rgb.1, rgb.2)
-    }
-
-    pub fn from_index(index: u8) -> Self {
-        let (r, g, b) = xterm256_index_to_rgb(index);
-        Self::new(r, g, b)
-    }
-
-    pub fn to_components(&self) -> (u8, u8, u8) {
-        (self.r, self.g, self.b)
-    }
-
-    pub fn to_srgb(&self) -> Srgb<u8> {
-        Srgb::from_components(self.to_components())
-    }
-
-    pub fn to_lab(&self) -> Lab {
-        Lab::from_color(self.to_srgb().into_linear::<f32>())
-    }
-}
-
-impl PartialEq for TermRgb {
-    fn eq(&self, other: &Self) -> bool {
-        self.r == other.r && self.g == other.g && self.b == other.b
-    }
-}
-
-impl Eq for TermRgb {}
-
+/*
 impl std::hash::Hash for TermRgb {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         let packed_rgb = pack_rgb(self.r, self.g, self.b);
@@ -449,12 +378,190 @@ impl ToString for TermRgb {
         }
     }
 }
+*/
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+// 22: not bold, 23: not italic, 24: not underline
+#[derive(EnumSetType, Debug, Hash)]
+pub enum TermAttr {
+    Bold = 1,
+    Italic = 3,
+    Underline = 4,
+}
+
+pub fn parse_ansi(c: &mut Chars) -> Result<Option<(Vec<u8>, char)>, Error> {
+    let mut accum = 0u32;
+    let mut state = 0u32;
+    let mut numbers = Vec::<u8>::new();
+    loop {
+        if let Some(cc) = c.next() {
+            let v: u32 = state | u32::from(cc);
+            //println!("GOT {:08x}", v);
+            match v {
+                0..=26 | 28..=0x10ffff => {
+                    return Ok(Some((numbers, v.try_into().unwrap())));
+                },
+                0x1b => /* escape */ { state = 1 << 24; },
+                0x100005b => /* [ */ { state = 2 << 24; },
+                0x2000030..=0x2000039 => /* 0-9 */ {
+                    accum = accum * 10 + (v & 0xf);
+                    if accum > 255 {
+                        return Err(Error::ParseIntOverflow);
+                    }
+                },
+                0x200003b => /* ; */ {
+                    numbers.push(accum as u8);
+                    accum = 0;
+                },
+                0x200006d => /* m */ {
+                    numbers.push(accum as u8);
+                    accum = 0;
+                    state = 0;
+                },
+                0x2000048 => /* H */ {
+                    numbers.truncate(0);
+                    state = 0;
+                },
+                _ => {
+                    return Err(Error::ParseBadChar{
+                        state: v >> 24,
+                        codepoint: v & 0xffffff
+                    });
+                },
+            }
+        } else {
+            return Ok(None);
+        }
+    }
+}
+
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq)]
 pub struct TermCell {
-    pub fg: TermRgb,
-    pub bg: TermRgb,
-    pub bold: bool,
-    pub italic: bool,
-    pub rune: char,
+    pub fg: TermColor,
+    pub bg: TermColor,
+    pub attr: EnumSet<TermAttr>,
+    pub codepoint: char,
+}
+
+// pub fn parse_ansi(c: &mut Chars) -> Result<Option<(Vec<u8>, char)>, Error> {
+
+fn mk_cell(
+    last_fg: &TermColor,
+    last_bg: &TermColor,
+    last_attr: &EnumSet<TermAttr>,
+    numbers: Vec<u8>,
+    codepoint: char
+) -> Result<TermCell, Error> {
+    let mut iter = numbers.into_iter();
+
+    let mut fg: Option<TermColor> = None;
+    let mut bg: Option<TermColor> = None;
+    let mut attr = last_attr.clone();
+
+    loop {
+        match iter.next() {
+            Some(number) => match number {
+                0 => {
+                    fg = Some(TermColor::from_index(None));
+                    bg = Some(TermColor::from_index(None));
+                    attr = enum_set!() as EnumSet<TermAttr>;
+                },
+                1 => { attr.insert(TermAttr::Bold); },
+                22 => { attr.remove(TermAttr::Bold); },
+                3 => { attr.insert(TermAttr::Italic); },
+                23 => { attr.remove(TermAttr::Italic); },
+                4 => { attr.insert(TermAttr::Underline); },
+                24 => { attr.remove(TermAttr::Underline); },
+                30..=37 | 39 | 90..=97 => {
+                    fg = Some(TermColor::Basic(((number as u8) - 30).try_into().unwrap()));
+                },
+                40..=47 | 49 | 100..=107 => {
+                    bg = Some(TermColor::Basic(((number as u8) - 40).try_into().unwrap()));
+                },
+                38 | 48 => {
+                    let fgbg = match number {
+                        38 => FOREGROUND,
+                        48 => BACKGROUND,
+                        _ => unreachable!(),
+                    };
+
+                    match iter.next() {
+                        Some(number) => match number {
+                            5 => {
+                                let r = iter.next();
+                                let g = iter.next();
+                                let b = iter.next();
+                                if r.is_some() && g.is_some() && b.is_some() {
+                                    let rgb = (r.unwrap(), g.unwrap(), b.unwrap());
+                                    let color = Some(TermColor::from_rgb(rgb));
+                                    match fgbg {
+                                        FOREGROUND => { fg = color; },
+                                        BACKGROUND => { bg = color; },
+                                    }
+                                } else {
+                                    return Err(Error::ParseTruncated);
+                                }
+                            },
+                            2 => {
+                                match iter.next() {
+                                    Some(index) => match index {
+                                        16..=255 => {
+                                            let color = Some(TermColor::from_index(Some(index)));
+                                            match fgbg {
+                                                FOREGROUND => { fg = color; },
+                                                BACKGROUND => { bg = color; },
+                                            }
+                                        },
+                                        _ => { return Err(Error::ParseBadCode); },
+                                    },
+                                    None => {
+                                        return Err(Error::ParseTruncated);
+                                    },
+                                }
+                            },
+                            _ => { return Err(Error::ParseBadCode); },
+                        },
+                        None => { return Err(Error::ParseTruncated); },
+                    }
+                },
+                _ => { return Err(Error::ParseBadCode); },
+            },
+            None => { break; },
+        }
+    }
+
+    Ok(TermCell {
+        fg: fg.unwrap_or_else(|| last_fg.clone()),
+        bg: bg.unwrap_or_else(|| last_bg.clone()),
+        attr,
+        codepoint,
+    })
+}
+
+pub fn parse_cells(c: &mut Chars) -> Result<Vec<TermCell>, Error> {
+    let mut last_fg = TermColor::from_index(None);
+    let mut last_bg = TermColor::from_index(None);
+    let mut last_attr: EnumSet<TermAttr> = enum_set!();
+    let mut cells = Vec::<TermCell>::new();
+
+    loop {
+        match parse_ansi(c) {
+            Ok(result) => match result {
+                Some((numbers, chr)) => {
+                    if chr == '\x0c' {
+                        println!("START OF FRAME");
+                    } else if chr == '\n' {
+                        println!("END OF LINE");
+                    } else {
+                        /* construct cell */
+                        todo!();
+                    }
+                },
+                None => { break; },
+            },
+            Err(error) => { return Err(error); },
+        }
+    }
+
+    Ok(cells)
 }
