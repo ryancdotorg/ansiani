@@ -473,10 +473,10 @@ fn mk_cell(
                 4 => { attr.insert(TermAttr::Underline); },
                 24 => { attr.remove(TermAttr::Underline); },
                 30..=37 | 39 | 90..=97 => {
-                    fg = Some(TermColor::Basic(((number as u8) - 30).try_into().unwrap()));
+                    fg = Some(TermColor::Basic((number - 30).try_into().unwrap()));
                 },
                 40..=47 | 49 | 100..=107 => {
-                    bg = Some(TermColor::Basic(((number as u8) - 40).try_into().unwrap()));
+                    bg = Some(TermColor::Basic((number - 40).try_into().unwrap()));
                 },
                 38 | 48 => {
                     let fgbg = match number {
@@ -486,40 +486,35 @@ fn mk_cell(
                     };
 
                     match iter.next() {
-                        Some(number) => match number {
-                            5 => {
-                                let r = iter.next();
-                                let g = iter.next();
-                                let b = iter.next();
-                                if r.is_some() && g.is_some() && b.is_some() {
-                                    let rgb = (r.unwrap(), g.unwrap(), b.unwrap());
-                                    let color = Some(TermColor::from_rgb(rgb));
-                                    match fgbg {
-                                        FOREGROUND => { fg = color; },
-                                        BACKGROUND => { bg = color; },
-                                    }
-                                } else {
-                                    return Err(Error::ParseTruncated);
-                                }
-                            },
-                            2 => {
-                                match iter.next() {
-                                    Some(index) => match index {
-                                        16..=255 => {
-                                            let color = Some(TermColor::from_index(Some(index)));
-                                            match fgbg {
-                                                FOREGROUND => { fg = color; },
-                                                BACKGROUND => { bg = color; },
-                                            }
-                                        },
-                                        _ => { return Err(Error::ParseBadCode); },
-                                    },
-                                    None => {
+                        Some(number) => {
+                            let color = match number {
+                                5 => {
+                                    let r = iter.next();
+                                    let g = iter.next();
+                                    let b = iter.next();
+                                    if r.is_some() && g.is_some() && b.is_some() {
+                                        let rgb = (r.unwrap(), g.unwrap(), b.unwrap());
+                                        TermColor::from_rgb(rgb)
+                                    } else {
                                         return Err(Error::ParseTruncated);
-                                    },
-                                }
-                            },
-                            _ => { return Err(Error::ParseBadCode); },
+                                    }
+                                },
+                                2 => {
+                                    match iter.next() {
+                                        Some(index) => match index {
+                                            16..=255 => TermColor::from_index(Some(index)),
+                                            _ => { return Err(Error::ParseBadCode); },
+                                        },
+                                        None => { return Err(Error::ParseTruncated); },
+                                    }
+                                },
+                                _ => { return Err(Error::ParseBadCode); },
+                            };
+
+                            match fgbg {
+                                FOREGROUND => { fg = Some(color); },
+                                BACKGROUND => { bg = Some(color); },
+                            }
                         },
                         None => { return Err(Error::ParseTruncated); },
                     }
