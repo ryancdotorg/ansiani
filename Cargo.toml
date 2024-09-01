@@ -1,15 +1,19 @@
 [package]
-name = "asciisub"
+name = "ansiani"
 version = "0.1.0"
 authors = ["Ryan Castellucci <code@ryanc.org>"]
 edition = "2021"
 resolver = "2"
 
 [dependencies]
+btree-range-map = "0.7"
 byteorder = "1"
 clap = { version = "4", features = ["derive"] }
 #dashmap = "6.0"
+enumset = "1.1"
+flate2 = "1.0"
 format-bytes = "0.3"
+itertools = "0.13"
 lazy_static = "1.5"
 palette = "0.7"
 rayon = "1.10"

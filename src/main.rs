@@ -1,198 +1,639 @@
+// our own imports
 mod term;
-use term::{TermRgb, xterm256_nearest};
-
-include!(concat!(env!("OUT_DIR"),"/lut_partial.rs"));
-
-use std::collections::HashSet;
-use rayon::prelude::*;
-
-use palette::{
-    Srgb,
-    lab::Lab,
-    convert::FromColor,
-    color_difference::Ciede2000,
+use term::{
+    TermCell,
+    TermColor,
+    change_attr_string,
+    parse_cells,
+    rgb_difference,
+    xterm256_index_to_rgb,
+    xterm256_nearest,
+    xterm256_threshold,
 };
 
-fn srgb_to_lab(srgb: Srgb<u8>) -> Lab {
-    Lab::from_color(srgb.into_linear::<f32>())
+mod input;
+use input::Input;
+
+// standard library
+use std::{
+    collections::HashMap,
+    env,
+    fs::{self, File},
+    io::{self, BufRead, Write, BufWriter},
+    path::Path,
+    thread,
+    time::{Duration, Instant},
+};
+
+// crates
+use btree_range_map::RangeMap;
+use byteorder::{BE, WriteBytesExt};
+use clap::{Args, Parser, Subcommand};
+use format_bytes::write_bytes;
+use itertools::{iproduct, Itertools};
+use zstd::stream::write::Encoder as ZstdEncoder;
+
+#[derive(Debug, Clone, Parser)]
+#[command(version, name = env!("CARGO_PKG_NAME"), long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
 }
 
+#[derive(Debug, Clone, Subcommand)]
+enum Commands {
+    Decode {
+        #[command(flatten)]
+        source: Source,
+        #[arg(short = 'n', long, value_name = "NS")]
+        delay: Option<u64>,
+    },
+    Encode {
+        #[arg(short, long, value_name = "FILE")]
+        input: String,
+        #[arg(short, long, value_name = "FILE")]
+        subtitles: Option<String>,
+    },
+    Map {
+        #[arg(short, long, value_name = "FILE")]
+        input: String,
+    },
+    Play {
+        #[arg(short, long, value_name = "FILE")]
+        input: String,
+    },
+    Nearest {
+    },
+}
+
+#[derive(Debug, Clone, Args)]
+#[group(multiple = false)]
+struct Source {
+    #[arg(short, long, group = "source", value_name = "DIR")]
+    directory: Option<String>,
+
+    #[arg(short, long, group = "source", value_name = "FILE")]
+    input: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SubtitleEntry {
+    show: u32, hide: u32,
+    row: usize, col: usize,
+    text: String,
+}
+
+
 fn main() {
-    /*
-    let foo = TermRgb { r: 98, g: 98, b: 98 };
-    println!("{:?}", foo);
-    println!("{}", foo.to_string());
-    let bar = TermRgb { r: 0, g: 95, b: 55 };
-    println!("{:?}", bar);
-    println!("{}", bar.to_string());
-    let qux = TermRgb { r: 42, g: 123, b: 234 };
-    println!("{:?}", qux);
-    println!("{}", qux.to_string());
-    */
+    let cli = Cli::parse();
 
-    let mut xt = Vec::<(u8, Lab)>::new();
-
-    for idx in 16u8..=255u8 {
-        xt.push((idx, TermRgb::from_index(idx).to_lab()));
+    match &cli.command {
+        Some(cmd) => match cmd {
+            Commands::Decode { source, delay, .. } => {
+                let _ = decode(source.clone(), *delay, None);
+            },
+            Commands::Encode {
+                input,
+                subtitles,
+                ..
+            } => {
+                let input = Input::from_path(input).expect("open failed: {:?}");
+                let subtitles = subtitles.as_ref().map(|s| {
+                    Input::from_path(s).expect("open failed: {:?}")
+                });
+                let _ = encode(input, subtitles);
+            },
+            Commands::Map { input, .. } => {
+                let _ = map(Input::from_path(input).expect("open failed: {:?}")  );
+            },
+            Commands::Play { input, .. } => {
+                let _ = play(Input::from_path(input).expect("open failed: {:?}")  );
+            },
+            Commands::Nearest { .. } => {
+                nearest();
+            },
+            #[allow(unreachable_patterns)]
+            _ => todo!(),
+        },
+        None => {},
     }
+}
 
-    for (idx, lab) in xt.iter() {
-        let l = lab.l;
-        let a = lab.a;
-        let b = lab.b;
-        println!("LAB {} {:e} {:e} {:e}", idx, l, a, b);
-    }
-
-    let _best_idx_lut = |srgb: Srgb<u8>| {
-        let (r, g, b) = (srgb.red, srgb.green, srgb.blue);
-        let lab = srgb_to_lab(srgb);
-
-        let mut best_diff = 999999.0;
-        let mut best_idx = 0;
-
-        let entry = (((r as usize) >> (8 - LUT_R_BITS)) << (LUT_R_SHIFT))
-                  | (((g as usize) >> (8 - LUT_G_BITS)) << (LUT_G_SHIFT))
-                  | (((b as usize) >> (8 - LUT_B_BITS)) << (LUT_B_SHIFT)) ;
-
-        let w_pos = LUT_OFFSETS[entry] as usize;
-        let (w, pos) = (w_pos >> 13, w_pos & 0x1fff);
-        let values = if w > 0 {
-            &LUT_PARTIAL[pos..(pos+w)]
-        } else {
-            let w = LUT_PARTIAL[pos] as usize;
-            &LUT_PARTIAL[(pos+1)..(pos+w+1)]
-        };
-
-        for idx in values.iter() {
-            let (_, other) = xt[(idx-16) as usize];
-            let diff = lab.difference(other);
-            if diff < best_diff {
-                best_diff = diff;
-                best_idx = *idx;
+fn parse_subtitles(subtitles: Input) -> Vec<SubtitleEntry> {
+    subtitles
+    .lines()
+    .filter_map(|s| {
+        match s {
+            Ok(s) => {
+                let s = s.trim_end().to_string();
+                if s.len() == 0 { return None; }
+                if s.starts_with("#") { return None; }
+                Some(s)
             }
+            Err(_) => None,
         }
+    })
+    .map(|line| {
+        let parts = line.split('\t').collect_tuple().unwrap();
+        let (_n, show, hide, row, col, text) = parts;
+        // convert
+        let show = parse_fsec_to_ms(show);
+        let hide = parse_fsec_to_ms(hide);
+        let row = row.parse::<usize>().unwrap();
+        let col = col.parse::<usize>().unwrap();
+        let text = text.to_string();
+        SubtitleEntry { show, hide, row, col, text }
+    })
+    .collect()
+}
 
-        best_idx
+fn parse_fsec_to_ms(s: &str) -> u32 {
+        let tv: Vec<_> = s.split('.').collect();
+        tv[0].parse::<u32>().unwrap() * 1000
+        + tv[1].parse::<u32>().unwrap()
+}
+
+fn should_update(a: &TermColor, b: &TermColor, threshold: f32) -> bool {
+    a != b && {
+        let a_rgb = a.to_rgb();
+        let b_rgb = b.to_rgb();
+        if a_rgb.is_some() && b_rgb.is_some() {
+            rgb_difference(a_rgb.unwrap(), b_rgb.unwrap()) > threshold
+        } else {
+            true
+        }
+    }
+}
+
+fn put_string(rows: &mut Vec<Vec<TermCell>>, r: usize, c: usize, s: &str) {
+    let mut attr = 0u32;
+    let mut state = 0;
+    let mut c = c;
+    // A crappy HTML parser...
+    for codepoint in s.chars().into_iter() {
+        let cc = u32::from(codepoint);
+        match state << 24 | cc {
+            // tag start
+            0x000003c => /* < */ { state = 1; }
+            // tag end (open)
+            0x200003e => /* > */ { state = 0; },
+            // tag end (close)
+            0x300003e => /* > */ { state = 0; },
+            // tag close
+            0x100002f => /* / */ { state = 3; }
+            // begin attribute
+            0x1000062 => /* b */ { state = 2; attr |= 0x02; },
+            0x1000069 => /* i */ { state = 2; attr |= 0x08; },
+            0x1000075 => /* u */ { state = 2; attr |= 0x10; },
+            // end attribute
+            0x3000062 => /* b */ { state = 2; attr &= 0xfd; },
+            0x3000069 => /* i */ { state = 2; attr &= 0xf7; },
+            0x3000075 => /* u */ { state = 2; attr &= 0xef; },
+            _ => {
+                let v = attr << 24 | cc;
+                rows[r][c] = TermCell::from_packed((0x010000ba, 0x01000010, v)).unwrap();
+                state = 0;
+                c += 1;
+            },
+        }
+    }
+}
+
+#[inline]
+fn write_codepoint_ansi(w: &mut dyn Write, codepoint: char) -> io::Result<()> {
+    let mut b = [255; 4];
+    w.write_all(codepoint.encode_utf8(&mut b).as_bytes())
+}
+
+#[inline]
+fn encode_frame(
+    w: &mut dyn Write,
+    mut rows: Vec<Vec<TermCell>>,
+    subs: &Option<&Vec<SubtitleEntry>>,
+) -> io::Result<()> {
+    let mut last = TermCell::from_packed((9, 9, 0)).unwrap();
+
+    match subs {
+        Some(subs) => {
+            for ent in *subs {
+                put_string(&mut rows, ent.row, ent.col, &ent.text);
+            }
+        },
+        None => (),
+    }
+
+    for row in rows.into_iter() {
+        for cell in row.into_iter() {
+            /*
+            if let Some((r, g, b)) = cell.fg.to_rgb() {
+                if let Some(index) = xterm256_threshold(r, g, b, 0.7) {
+                    cell.set_fg_index(index);
+                }
+            }
+            if let Some((r, g, b)) = cell.bg.to_rgb() {
+                if let Some(index) = xterm256_threshold(r, g, b, 0.7) {
+                    cell.set_bg_index(index);
+                }
+            }
+            */
+
+            // TODO break this out into a function...
+            let update_fg = should_update(&last.fg, &cell.fg, 0.7);
+            let update_bg = should_update(&last.bg, &cell.bg, 0.7);
+            let update_attr = cell.attr != last.attr;
+
+            let mut e = Vec::<String>::new();
+            if update_attr { e.push(change_attr_string(&last.attr, &cell.attr)); }
+            if update_fg { e.push(cell.fg_string()); }
+            if update_bg { e.push(cell.bg_string()); }
+            if e.len() > 0 {
+                write_bytes!(w, b"\x1b[{}m", e.join(";").into_bytes())?;
+            }
+
+            write_codepoint_ansi(w, cell.codepoint)?;
+
+            last = cell.clone();
+        }
+    }
+
+    // end of transmission block (frame)
+    write_bytes!(w, b"\x17")?;
+
+    Ok(())
+}
+
+fn encode(mut reader: Input, subtitles: Option<Input>) -> io::Result<()> {
+    let mut w = BufWriter::new(std::io::stdout());
+
+    let mut first_frame = true;
+
+    let mut rows = Vec::<Vec::<TermCell>>::new();
+    let mut row = Vec::<TermCell>::new();
+
+    let sub_ents = match subtitles {
+        Some(subtitles) => parse_subtitles(subtitles),
+        None => Vec::<_>::new(),
     };
 
-    let (r_bits, g_bits, b_bits) = (4, 4, 4);
-    //let (r_shl, g_shl, b_shl) = (0, r_bits, r_bits + g_bits);
-    let (r_shl, g_shl, b_shl) = (g_bits + b_bits, b_bits, 0);
-    let (r_shr, g_shr, b_shr) = (8 - r_bits, 8 - g_bits, 8 - b_bits);
-    let (r_mask, g_mask, b_mask) = ((1 << r_bits) - 1, (1 << g_bits) - 1, (1 << b_bits) - 1);
-    let (r_count, g_count, b_count) = ((1 << r_shr) - 1, (1 << g_shr) - 1, (1 << b_shr) - 1);
-
-    let mut entries = Vec::<((u8, u8, u8), HashSet<u8>)>::new();
-    for q in 0..(1 << (r_bits + g_bits + b_bits)) {
-        let r_base = (((q >> r_shl) as u8) & r_mask) << r_shr;
-        let g_base = (((q >> g_shl) as u8) & g_mask) << g_shr;
-        let b_base = (((q >> b_shl) as u8) & b_mask) << b_shr;
-        entries.push(((r_base, g_base, b_base), HashSet::<u8>::new()));
+    // NB: assumes no overlaps
+    let mut sub_map = HashMap::<(u32, u32), Vec<SubtitleEntry>>::new();
+    for ent in sub_ents {
+        let key = (ent.show, ent.hide);
+        match sub_map.get_mut(&key) {
+            Some(v) => {
+                v.push(ent);
+            },
+            None => {
+                let mut v = Vec::<SubtitleEntry>::new();
+                v.push(ent);
+                sub_map.insert(key, v);
+            },
+        };
     }
 
-    entries.par_iter_mut().for_each(|(key, ref mut set)| {
-        let (r_base, g_base, b_base) = *key;
+    let mut subs = RangeMap::<u32, Vec<SubtitleEntry>>::new();
+    for (key, val) in sub_map.drain() {
+        subs.insert(key.0..=key.1, val);
+    }
 
-        for r in r_base..=(r_base+r_count) {
-            for g in g_base..=(g_base+g_count) {
-                for b in b_base..=(b_base+b_count) {
-                    let best_1 = xterm256_nearest(r, g, b);
-                    set.insert(best_1);
-                }
-            }
+    let mut timecode = 0;
+
+    // process cells
+    loop {
+        let cell = TermCell::read_packed(&mut reader);
+        match cell {
+            Ok(cell) => match cell.codepoint {
+                '\x16' => {
+                    // timestamp
+                    timecode = cell.as_timecode().unwrap();
+                    write_bytes!(&mut w, b"\x1b[H{}\x1b[1H", cell.fg_bytes())?;
+                    if first_frame {
+                        write_bytes!(&mut w, b"\x1b[J")?;
+                        first_frame = false;
+                    }
+                },
+                '\x17' => {
+                    // end of frame
+                    let v = subs.get(timecode);
+                    encode_frame(&mut w, rows, &v)?;
+                    rows = Vec::<Vec::<TermCell>>::new();
+                },
+                '\n' => {
+                    // end of row
+                    row.push(cell);
+                    rows.push(row);
+                    row = Vec::<TermCell>::new();
+                },
+                '\x0c' => {/* ignored */},
+                _ => row.push(cell),
+            },
+            Err(_) => { break Ok(()); },
         }
-    });
+    }
+}
 
-    let mut lut_idx = Vec::<u16>::new();
-    let mut lut_dat = Vec::<u8>::new();
+/// frame syncronize with timecode
+#[inline]
+fn write_timecode_cell(w: &mut dyn Write, timecode: u32) -> io::Result<()> {
+    if timecode >= (1<<24) {
+        return Err(io::Error::other(format!("bad timecode: {}", timecode)));
+    }
+    w.write_u8(0x0f)?; w.write_u24::<BE>(timecode)?;
+    w.write_u8(0x0f)?; w.write_u24::<BE>(timecode)?;
+    w.write_u32::<BE>(0x16)
+}
 
-    for (_key, set) in entries {
-        let mut values = set.into_iter().collect::<Vec<_>>();
-        values.sort();
-        //println!("//\t{:?}\t{:?}\t{}", key, values, values.len());
+/// write end of frame cell
+#[inline]
+fn write_end_frame_cell(w: &mut dyn Write) -> io::Result<()> {
+    w.write_all(b"\0\0\0\x09\0\0\0\x09\0\0\0\x17")
+}
 
-        let n: u8 = values.len().try_into().unwrap();
+fn decode(
+    source: Source,
+    delay: Option<u64>,
+    timecode: Option<u32>
+) -> io::Result<()> {
+    let mut w = BufWriter::new(std::io::stdout());
 
-        let n_prefix = if n < 8 {
-            // for small palette entry lists, encode length in top three bits
-            (n as u16) << 13
-        } else {
-            // otherwise, add length prefix to palette entry list
-            values.insert(0, n);
-            0u16
+    let mut line = String::new();
+
+    let inputs = if let Some(directory) = source.directory {
+        let paths = fs::read_dir(directory).unwrap();
+        let mut paths: Vec<_> = paths
+            .into_iter()
+            .map(|item| item.unwrap().path())
+            .collect();
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|p| Input::from_path(p))
+            .collect::<io::Result<Vec<_>>>()?
+    } else if let Some(input) = source.input {
+        let mut inputs = Vec::<Input>::new();
+        inputs.push(input.try_into()?);
+        inputs
+    } else {
+        let mut inputs = Vec::<Input>::new();
+        inputs.push(Input::from_stdin()?);
+        inputs
+    };
+
+    let mut timecode = timecode.unwrap_or(0);
+    let mut timecode_ns = timecode as u64 * 1000000;
+    for mut r in inputs.into_iter() {
+        // TODO: move to function
+        let mut frame_row = 0;
+        let mut frame_count = 0;
+        // each line of file
+        loop {
+            line.clear();
+            if r.read_line(&mut line)? == 0 {
+                // end of transmission block (end of frame)
+                write_end_frame_cell(&mut w)?;
+                break;
+            }
+
+            let cells: Vec<_> = parse_cells(&mut line.chars())
+                .map_err(|e| io::Error::other(e))?
+                .into_iter()
+                .filter(|item| item.codepoint != '\x17')
+                .collect();
+
+            // a line with no cells is probably eof
+            if cells.len() == 0 {
+                eprintln!("no cells frame {} row {}", frame_count, frame_row);
+                break;
+            }
+
+            match cells[0].codepoint {
+                '\x0c' | '\x16' => {
+                    if cells.len() == 1 {
+                        // probably end of file
+                        break;
+                    }
+                    //eprintln!("\x1b[95m[+] NEW FRAME: {}\x1b[m", frame_count);
+                    frame_row = 0;
+                },
+                _ => {},
+            }
+
+            if frame_row == 0 {
+                if frame_count > 0 {
+                    write_end_frame_cell(&mut w)?;
+                    timecode_ns += delay.expect("need a frame delay");
+                    timecode = (timecode_ns / 1000000) as u32;
+                }
+                if cells[0].as_timecode().is_none() {
+                    write_timecode_cell(&mut w, timecode)?;
+                }
+                frame_count += 1;
+            }
+
+            /*
+            eprintln!(
+                "\x1b[92mGot {} cells ({} chars) for frame {} row {}\x1b[m",
+                cells.len(), line.len(),
+                frame_count, frame_row
+            );
+            */
+
+            for bytes in cells.into_iter().filter_map(|cell| {
+                // skip start of frame cells without a timecode
+                match cell.codepoint {
+                    '\x0c' => None,
+                    _ => Some(cell.to_packed_bytes()),
+                }
+            }) {
+                w.write_all(&bytes)?;
+            }
+
+            frame_row += 1;
+        }
+    }
+
+    Ok(())
+}
+
+fn map(mut reader: Input) -> io::Result<()> {
+    let mut line = String::new();
+    let mut row = String::new();
+    let binding = reader.as_label();
+    let binding: &Path = binding.as_ref();
+    let mut base = binding.to_path_buf();
+    let _ = base.pop();
+    let mut count = 1;
+
+    let mut last_frame_stem: String = "".to_string();
+
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).unwrap() == 0 {
+            break Ok(());
+        }
+        let line = line.trim_end();
+        let parts: Vec<_> = line.split_whitespace().collect();
+        let frame_stem = parts[0];
+        let time_ms = parse_fsec_to_ms(parts[1]);
+
+        if last_frame_stem != frame_stem {
+            let mut ansi = base.clone();
+            ansi.push("ansi");
+            ansi.push(format!("{}.ansi.zst", frame_stem));
+
+            let mut cell = base.clone();
+            cell.push("cell");
+            cell.push(format!("{:06}.cell.zst", count));
+
+            last_frame_stem = frame_stem.to_string();
+
+            let mut input = Input::from_path(ansi.clone()).unwrap();
+            let ofile = File::create(cell).unwrap();
+            //let mut writer = BufWriter::new(ofile);
+            let mut writer = ZstdEncoder::new(ofile, 11).unwrap();
+            let mut time = Vec::<u8>::new();
+
+            // emit frame syncronize
+            time.push(0x0f);
+            time.push((time_ms >> 16) as u8);
+            time.push((time_ms >>  8) as u8);
+            time.push((time_ms >>  0) as u8);
+
+            time.push(0x0f);
+            time.push((time_ms >> 16) as u8);
+            time.push((time_ms >>  8) as u8);
+            time.push((time_ms >>  0) as u8);
+
+            time.append(&mut b"\0\0\0\x16".to_vec());
+
+            let _ = writer.write_all(&time);
+
+            // each line of file
+            loop {
+                row.clear();
+                if input.read_line(&mut row).unwrap() == 0 {
+                    break;
+                }
+
+                let mut chars = row.chars();
+                let cells = parse_cells(&mut chars);
+                let mut bytes = Vec::<u8>::new();
+                for mut packed in cells.unwrap().into_iter().map(|c| c.to_packed_bytes()) {
+                    bytes.append(&mut packed);
+                }
+
+                let _ = writer.write_all(&bytes);
+            }
+
+            // end of transmission block (end of frame)
+            writer.write_all(b"\0\0\0\x09\0\0\0\x09\0\0\0\x17")?;
+
+            writer.finish()?;
+
+            println!("{:06} {:8} {} {:?}", count, time_ms, frame_stem, ansi);
+            count += 1;
+        }
+
+    }
+}
+
+fn read_timecode(reader: &mut Input, buf: &mut Vec<u8>) -> io::Result<u64> {
+    buf.truncate(0);
+    match reader.read_until(0x16, buf) {
+        Ok(size) => {
+            if size == 0 { return Ok(0); }
+            buf.truncate(0);
+            reader.read_until(0x74/*t*/, buf).unwrap();
+            Ok(
+                String::from_utf8_lossy(&buf)
+                .trim_end_matches('t')
+                .to_string()
+                .parse::<u64>()
+                .unwrap()
+            )
+        },
+        Err(e) => Err(e),
+    }
+}
+
+fn play(mut reader: Input) {
+    let mut w = BufWriter::with_capacity(1<<17, std::io::stdout());
+
+    let mut buf = Vec::<u8>::with_capacity(1<<20); // 1MiB
+
+    let t_start = Instant::now();
+    let mut frame_count = 0usize;
+    let mut dropped = 0usize;
+
+    loop {
+        frame_count += 1;
+        let timecode = read_timecode(&mut reader, &mut buf).unwrap();
+
+        let skip = timecode > 0 && {
+            let then = t_start + Duration::from_millis(timecode/10);
+            let wait = then - Instant::now();
+            if wait > Duration::ZERO {
+                // wait for next frame
+                thread::sleep(wait);
+                false
+            } else {
+                dropped += 1;
+                true
+            }
         };
 
-        'store: {
-            // is this set of values the same as the last one?
-            if lut_dat.len() >= (n as usize) {
-                let tail = &lut_dat[(lut_dat.len()-(n as usize))..];
-                let mut v = tail.to_vec();
-                v.sort();
-                if v == values {
-                    let pos: u16 = (lut_dat.len()-(n as usize)).try_into().unwrap();
-                    lut_idx.push(n_prefix | pos);
-                    break 'store;
-                }
+        buf.truncate(0);
+        let size = match reader.read_until(0x17, &mut buf) {
+            Ok(size) => {
+                let size = size - 1; // trim ETB
+                buf.truncate(if skip { 0 } else { size });
+                size
+            },
+            Err(e) => {
+                eprintln!("Error: {:?}", e);
+                break;
             }
+        };
 
-            // sliding window search for a match
-            for (i, w) in lut_dat.windows(n as usize).enumerate() {
-                let mut v = Vec::from(w);
-                // if length is to be encoded in offset, order doesn't matter
-                if n < 8 { v.sort(); }
-                if v == values {
-                    let pos: u16 = i.try_into().unwrap();
-                    lut_idx.push(n_prefix | pos);
-                    break 'store;
-                }
-            }
+        // timestamp components
+        let t_hh = timecode / (3600 * 1000);
+        let t_mm = (timecode / (60 * 1000)) % 60;
+        let t_ss = (timecode / 1000) % 60;
+        let t_ms = timecode % 1000;
 
-            // can we add just one index maybe?
-            let back: usize = (n - 1).into();
-            if n > 1 && lut_dat.len() >= back && n < 8 {
-                let pos: u16 = (lut_dat.len()-back).try_into().unwrap();
-                let mut tail = Vec::from(&lut_dat[(pos as usize)..]);
-                tail.sort();
+        // status line
+        let status = format!(
+            "  [{:6}][{:6}b][{:02}:{:02}:{:02}.{:03}]",
+            frame_count, size,
+            t_hh, t_mm, t_ss, t_ms,
+        );
 
-                for p in 0..(n as usize) {
-                    let next = values[p];
-                    let mut subset = Vec::from(&values[0..p]);
-                    let mut end = Vec::from(&values[(p+1)..]);
-                    subset.append(&mut end);
-
-                    if tail == subset {
-                        //println!("SUB {:?} {:?} {:?}", values, &lut_dat[(pos as usize)..], next);
-                        lut_idx.push(n_prefix | pos);
-                        lut_dat.push(next);
-                        break 'store;
-                    }
-                }
-            }
-
-            let pos: u16 = lut_dat.len().try_into().unwrap();
-            lut_idx.push(n_prefix | pos);
-
-            for value in values.iter() {
-                lut_dat.push(*value);
-            }
+        // add status line to buffer
+        buf.write_all(status.as_bytes()).unwrap();
+        if dropped > 0 {
+            write_bytes!(&mut buf, b" Dropped: {}", dropped).unwrap();
         }
+        buf.write_all(b"\x1b[G").unwrap();
 
-        //println!("{:?}\t{:?}\t{}", key, values, values.len());
+        // output buffer
+        w.write_all(&buf).unwrap();
+
+        // flush
+        let _ = w.flush();
     }
-    println!("const LUT{}{}{}_IDX: &[u16] = &{:?};", r_bits, g_bits, b_bits, lut_idx);
-    println!("const LUT{}{}{}_DAT: &[u8] = &{:?};", r_bits, g_bits, b_bits, lut_dat);
-    println!("// {} + {} = {}", lut_idx.len() * 2, lut_dat.len(), lut_idx.len() * 2 + lut_dat.len());
 
-    /*
-    let a = Srgb::new(42u8, 123, 234);
-    let b = Srgb::new(44u8, 124, 233);
-    let aa = srgb_to_lab(a);
-    println!("{:?}", aa);
-    let bb = Lab::from_color(b.into_linear::<f32>());
-    println!("{:?}", bb);
+    w.write_all(b"\n").unwrap();
+}
 
-    println!("{}", aa.improved_difference(bb));
-    */
-
+fn nearest() {
+    for (r, g, b) in iproduct!(0u8..=255, 0u8..=255, 0u8..=255) {
+        let rgb = (r, g, b);
+        let index = xterm256_nearest(r, g, b);
+        let compare = xterm256_index_to_rgb(index);
+        let diff = rgb_difference(rgb, compare);
+        if diff < 20.0 {
+            println!("{:3}\t#{:02x}{:02x}{:02x}\t{:.6}", index, r, g, b, diff);
+        }
+    }
 }
 

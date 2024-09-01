@@ -1,0 +1,30 @@
+# Rust
+Cargo.lock
+/target
+
+# project specific
+*.txt
+
+*.asb
+*.srt
+*.son
+
+*.bmp
+*.png
+
+*.ifo
+*.IFO
+*.vob
+*.VOB
+
+# general
+.*
+*.out
+*.tmp
+*.bak
+
+# exceptions
+!/.gitignore
+
+# project specific exceptions
+!/.nearest.zst

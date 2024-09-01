@@ -1,23 +1,21 @@
-//use lru::LruCache;
-//use std::num::NonZeroUsize;
+use std::{
+    io::{self, Read, Write},
+    str::Chars,
+    sync::atomic::{AtomicU8, Ordering},
+};
 
+use byteorder::{BE, ReadBytesExt};
 use enumset::{enum_set, EnumSet, EnumSetType};
-//use format_bytes::{DisplayBytes, format_bytes, write_bytes};
 use format_bytes::write_bytes;
 use lazy_static::lazy_static;
-use std::io::{self, Write};
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::str::Chars;
 
 include!(concat!(env!("OUT_DIR"),"/lut_palette.rs"));
 include!(concat!(env!("OUT_DIR"),"/lut_partial.rs"));
 
-#[allow(dead_code, unused_imports)]
 use palette::{
     Srgb,
     lab::Lab,
     convert::FromColor,
-    convert::IntoColor,
     color_difference::Ciede2000,
     color_difference::ImprovedCiede2000,
 };
@@ -27,18 +25,24 @@ use thiserror::Error as ThisError;
 pub enum Error {
     #[error("invalid packed color: {0:08x}")]
     BadPacked(u32),
+    #[error("invalid codepoint: {0}")]
+    BadCodepoint(u32),
     #[error("invalid color index, must be [16..=255], not {0}")]
     BadIndex256(u8),
     #[error("invalid color index, must be [0..=7 | 9 | 60..=67], not {0}")]
     BadIndex16(u8),
+    #[error("invalid time code, must be [0..=16777215], not {0}")]
+    BadTimeCode(u32),
     #[error("parse failed, integer overflow")]
     ParseIntOverflow,
     #[error("parse failed, unexpected codepoint {codepoint} in state {state}")]
     ParseBadChar { state: u32, codepoint: u32 },
-    #[error("parse failed, unexpected code")]
-    ParseBadCode,
+    #[error("parse failed, unexpected code {code}")]
+    ParseBadCode { code: u8 },
     #[error("parse failed, truncated")]
     ParseTruncated,
+//    #[error("io error {0:?}")]
+//    IoError(io::Error),
 }
 
 lazy_static! {
@@ -60,22 +64,31 @@ fn rgb_to_lab(rgb: (u8, u8, u8)) -> Lab {
     Lab::from_color(srgb.into_linear::<f32>())
 }
 
+pub fn rgb_difference(rgb1: (u8, u8, u8), rgb2: (u8, u8, u8)) -> f32 {
+    let lab1 = rgb_to_lab(rgb1);
+    let lab2 = rgb_to_lab(rgb2);
+
+    lab1.improved_difference(lab2)
+}
+
 fn pack_rgb(r: u8, g: u8, b: u8) -> usize {
     ((r as usize) << 16) | ((g as usize) << 8) | (b as usize)
 }
 
 fn xterm256_rgb_part(v: u8) -> Option<u8> {
-    if v == 0 {
-        Some(0)
-    } else if v >= 55 && (v - 55) % 40 == 0 {
-        Some(1 + (v - 55) / 40)
-    } else {
-        None
+    match v {
+          0 => Some(0),
+         95 => Some(1),
+        135 => Some(2),
+        175 => Some(3),
+        215 => Some(4),
+        255 => Some(5),
+        _ => None,
     }
 }
 
 fn xterm256_grey_part(v: u8) -> Option<u8> {
-    if v >= 8 && (v - 8) % 10 == 0 {
+    if v >= 8 && (v - 8) % 10 == 0 && v <= 238 {
         Some(1 + (v - 8) / 10)
     } else {
         None
@@ -125,10 +138,35 @@ pub fn xterm256_exact(r: u8, g: u8, b: u8) -> Option<u8> {
     None
 }
 
+pub fn xterm256_threshold(r: u8, g: u8, b: u8, threshold: f32) -> Option<u8> {
+    // NaN comparisons always fail, so we don't want to use < 0.0
+    if !(threshold >= 0.0) {
+        None
+    } else if let Some(index) = xterm256_exact(r, g, b) {
+        let packed_rgb = pack_rgb(r, g, b);
+        lut_xterm256_nearest[packed_rgb].store(index, Ordering::Relaxed);
+        Some(index)
+    } else {
+        let index = xterm256_nearest(r, g, b);
+        // biggest difference from nearest is for #002502
+        if threshold > 11.51406 { return index; }
+        let other = lut_xterm256_lab[index as usize];
+        let lab = rgb_to_lab((r, g, b));
+        if lab.difference(other) <= threshold {
+            Some(index)
+        } else {
+            None
+        }
+    }
+}
+
 pub fn xterm256_nearest(r: u8, g: u8, b: u8) -> u8 {
     let packed_rgb = pack_rgb(r, g, b);
     let index = lut_xterm256_nearest[packed_rgb].load(Ordering::Relaxed);
     if index != 0 {
+        index
+    } else if let Some(index) = xterm256_exact(r, g, b) {
+        lut_xterm256_nearest[packed_rgb].store(index, Ordering::Relaxed);
         index
     } else {
         let lab = rgb_to_lab((r, g, b));
@@ -165,9 +203,8 @@ pub fn xterm256_nearest(r: u8, g: u8, b: u8) -> u8 {
 }
 
 
-#[allow(dead_code)]
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct Xterm256(u8);
 
 impl TryFrom<u8> for Xterm256 {
@@ -181,10 +218,33 @@ impl TryFrom<u8> for Xterm256 {
     }
 }
 
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct TimeCode(u32);
+
+impl TryFrom<u32> for TimeCode {
+    type Error = Error;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0u32..=16777215 => Ok(Self(value)),
+            _ => Err(Error::BadTimeCode(value)),
+        }
+    }
+
+}
+
+impl TimeCode {
+    fn as_u32(self) -> u32 {
+        self.0 as u32
+    }
+}
+
 #[repr(u8)]
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Basic {
+    Default = 9,
     Black = 0,
     Red,
     Green,
@@ -193,7 +253,6 @@ pub enum Basic {
     Magenta,
     Cyan,
     White,
-    Default = 9,
     BrightBlack = 60,
     BrightRed,
     BrightGreen,
@@ -238,15 +297,14 @@ enum FgBg {
 const FOREGROUND: FgBg = FgBg::Foreground;
 const BACKGROUND: FgBg = FgBg::Background;
 
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum TermColor {
-    Rgb { r: u8, g: u8, b: u8, },
+    Rgb { r: u8, g: u8, b: u8 },
     Xterm256(Xterm256),
     Basic(Basic),
+    TimeCode(TimeCode),
 }
 
-#[allow(dead_code)]
 impl TermColor {
     #[inline(always)]
     fn fgbg_write(&self, base: FgBg, w: &mut dyn Write) -> io::Result<()> {
@@ -255,6 +313,28 @@ impl TermColor {
             Self::Rgb { r, g, b } => write_bytes!(w, b"{};2;{};{};{}", &(base + 8), r, g, b),
             Self::Xterm256 { 0: inner } => write_bytes!(w, b"{};5;{}", &(base + 8), inner.0),
             Self::Basic { 0: inner } => write_bytes!(w, b"{}", &(base + inner as u8)),
+            Self::TimeCode { 0: inner } => {
+                match base {
+                    30 => write_bytes!(w, b"\x16{}t", inner.as_u32()),
+                    _ => write_bytes!(w, b""),
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn fgbg_string(&self, base: FgBg) -> String {
+        let base = base as u8;
+        match *self {
+            Self::Rgb { r, g, b } => format!("{};2;{};{};{}", &(base + 8), r, g, b),
+            Self::Xterm256 { 0: inner } => format!("{};5;{}", &(base + 8), inner.0),
+            Self::Basic { 0: inner } => format!("{}", &(base + inner as u8)),
+            Self::TimeCode { 0: inner } => {
+                match base {
+                    30 => format!("\x16{}t", inner.as_u32()),
+                    _ => format!(""),
+                }
+            }
         }
     }
 
@@ -267,23 +347,39 @@ impl TermColor {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn fg_write(&self, w: &mut dyn Write) -> io::Result<()> {
         self.fgbg_write(FOREGROUND, w)
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn bg_write(&self, w: &mut dyn Write) -> io::Result<()> {
         self.fgbg_write(BACKGROUND, w)
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn fg_bytes(&self) -> Vec<u8> {
         self.fgbg_bytes(FOREGROUND)
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn bg_bytes(&self) -> Vec<u8> {
         self.fgbg_bytes(BACKGROUND)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn fg_string(&self) -> String {
+        self.fgbg_string(FOREGROUND)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn bg_string(&self) -> String {
+        self.fgbg_string(BACKGROUND)
     }
 
     pub fn from_packed(packed: u32) -> Result<Self, Error> {
@@ -296,9 +392,13 @@ impl TermColor {
             },
             0x02000000..=0x02ffffff => {
                 let r = (packed >> 16) as u8;
-                let g = (packed >> 16) as u8;
-                let b = (packed >> 16) as u8;
+                let g = (packed >>  8) as u8;
+                let b = (packed >>  0) as u8;
                 Ok(Self::Rgb { r, g, b })
+            },
+            0x0f000000..=0x0fffffff => {
+                let t = packed & 0xffffff;
+                Ok(Self::TimeCode(t.try_into().unwrap()))
             },
             _ => Err(Error::BadPacked(packed)),
         }
@@ -309,6 +409,7 @@ impl TermColor {
             Self::Rgb { r, g, b } => (2u32 << 24) | (pack_rgb(r, g, b) as u32),
             Self::Xterm256 { 0: inner } => (1u32 << 24) | (inner.0 as u32),
             Self::Basic { 0: inner } => inner as u32,
+            Self::TimeCode { 0: inner } => 0x0f000000 + inner.as_u32(),
         }
     }
 
@@ -325,6 +426,7 @@ impl TermColor {
             Self::Rgb { r, g, b } => Some((r, g, b)),
             Self::Xterm256 { 0: inner } => Some(xterm256_index_to_rgb(inner.0)),
             Self::Basic { 0: _ } => None,
+            Self::TimeCode { 0: _ } => None,
         }
     }
 
@@ -339,11 +441,21 @@ impl TermColor {
         }
     }
 
+    #[allow(dead_code)]
     pub fn to_index(&self) -> Option<u8> {
         match *self {
             Self::Rgb { r, g, b } => Some(xterm256_nearest(r, g, b)),
             Self::Xterm256 { 0: inner } => Some(inner.0),
             Self::Basic { 0: inner } => inner.to_index(),
+            Self::TimeCode { 0: _ } => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_timecode(&self) -> Option<u32> {
+        match *self {
+            Self::TimeCode { 0: inner } => Some(inner.as_u32()),
+            _ => None,
         }
     }
 
@@ -380,12 +492,66 @@ impl ToString for TermRgb {
 }
 */
 
-// 22: not bold, 23: not italic, 24: not underline
+// 1: bold
+// 2: dim
+// 3: italic
+// 4: underline
+// 5: blink
+// 7: reverse
+// 8: conceal
+// 9: strike
+// 21: not bold (non-standard/bug)
+// 22: not bold/dim
+// 23: not italic
+// 24: not underline
+// 25: not blink
+// 27: not reverse
+// 28: not conceal
+// 29: not strike
 #[derive(EnumSetType, Debug, Hash)]
 pub enum TermAttr {
     Bold = 1,
     Italic = 3,
     Underline = 4,
+}
+
+impl ToString for TermAttr {
+    fn to_string(&self) -> String {
+        match *self {
+            TermAttr::Bold => "1".to_string(),
+            TermAttr::Italic => "3".to_string(),
+            TermAttr::Underline => "4".to_string(),
+        }
+    }
+}
+
+#[inline]
+fn push_attr(
+    attrs: &mut Vec<String>,
+    a: &EnumSet<TermAttr>,
+    b: &EnumSet<TermAttr>,
+    check: TermAttr,
+    code: &str,
+) {
+    if a.contains(check) && !b.contains(check) {
+        attrs.push(code.to_string());
+    }
+}
+
+pub fn change_attr_string(old: &EnumSet<TermAttr>, new: &EnumSet<TermAttr>) -> String {
+    let mut attrs = Vec::<String>::new();
+
+    // clear
+    push_attr(&mut attrs, &old, &new, TermAttr::Bold, "22");
+    push_attr(&mut attrs, &old, &new, TermAttr::Italic, "23");
+    push_attr(&mut attrs, &old, &new, TermAttr::Underline, "24");
+
+    // set
+    push_attr(&mut attrs, &new, &old, TermAttr::Bold, "1");
+    push_attr(&mut attrs, &new, &old, TermAttr::Italic, "3");
+    push_attr(&mut attrs, &new, &old, TermAttr::Underline, "4");
+
+    attrs.join(";")
 }
 
 pub fn parse_ansi(c: &mut Chars) -> Result<Option<(Vec<u8>, char)>, Error> {
@@ -397,10 +563,13 @@ pub fn parse_ansi(c: &mut Chars) -> Result<Option<(Vec<u8>, char)>, Error> {
             let v: u32 = state | u32::from(cc);
             //println!("GOT {:08x}", v);
             match v {
-                0..=26 | 28..=0x10ffff => {
+                0..=0x15 | 0x17..=0x1a | 0x1c..=0x10ffff => {
                     return Ok(Some((numbers, v.try_into().unwrap())));
                 },
-                0x1b => /* escape */ { state = 1 << 24; },
+                0x0000016 => /* frame syncronize */ {
+                    state = 0xf << 24;
+                },
+                0x000001b => /* escape */ { state = 1 << 24; },
                 0x100005b => /* [ */ { state = 2 << 24; },
                 0x2000030..=0x2000039 => /* 0-9 */ {
                     accum = accum * 10 + (v & 0xf);
@@ -417,8 +586,29 @@ pub fn parse_ansi(c: &mut Chars) -> Result<Option<(Vec<u8>, char)>, Error> {
                     accum = 0;
                     state = 0;
                 },
-                0x2000048 => /* H */ {
+                0x2000047 => /* G */ {
                     numbers.truncate(0);
+                    state = 0;
+                },
+                0x2000048 => /* H */ {
+                    return Ok(Some((numbers, '\x0c')));
+                },
+                0x200004a => /* J */ {
+                    numbers.truncate(0);
+                    state = 0;
+                },
+                0xf000030..=0xf000039 => /* 0-9 */ {
+                    accum = accum * 10 + (v & 0xf);
+                    if accum > 16777215 {
+                        return Err(Error::ParseIntOverflow);
+                    }
+                },
+                0xf000074 => /* t */ {
+                    numbers.push(255u8);
+                    numbers.push((accum >> 16) as u8);
+                    numbers.push((accum >>  8) as u8);
+                    numbers.push((accum >>  0) as u8);
+                    accum = 0;
                     state = 0;
                 },
                 _ => {
@@ -434,7 +624,6 @@ pub fn parse_ansi(c: &mut Chars) -> Result<Option<(Vec<u8>, char)>, Error> {
     }
 }
 
-
 #[derive(Clone, Copy, Debug, Hash, PartialEq)]
 pub struct TermCell {
     pub fg: TermColor,
@@ -443,20 +632,110 @@ pub struct TermCell {
     pub codepoint: char,
 }
 
-// pub fn parse_ansi(c: &mut Chars) -> Result<Option<(Vec<u8>, char)>, Error> {
+impl TermCell {
+    pub fn from_packed(tup: (u32, u32, u32)) -> Result<Self, Error> {
+        let fg = TermColor::from_packed(tup.0)?;
+        let bg = TermColor::from_packed(tup.1)?;
+        let attr = EnumSet::<TermAttr>::from_u32(tup.2 >> 24);
+        let c = tup.2 & 0xffffff;
+        let codepoint = char::from_u32(c).ok_or_else(|| Error::BadCodepoint(c))?;
+
+        Ok(Self { fg, bg, attr, codepoint })
+    }
+
+    #[inline]
+    pub fn to_packed(&self) -> (u32, u32, u32) {
+        let fg = self.fg.to_packed();
+        let bg = self.bg.to_packed();
+        let attr = self.attr.as_u32() << 24;
+        let codepoint: u32 = attr | u32::from(self.codepoint);
+
+        (fg, bg, codepoint)
+    }
+
+    pub fn to_packed_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::<u8>::new();
+        let packed = self.to_packed();
+        bytes.extend_from_slice(&mut packed.0.to_be_bytes());
+        bytes.extend_from_slice(&mut packed.1.to_be_bytes());
+        bytes.extend_from_slice(&mut packed.2.to_be_bytes());
+
+        bytes
+    }
+
+    pub fn read_packed(r: &mut dyn Read) -> io::Result<Self> {
+        let p0 = r.read_u32::<BE>()?;
+        let p1 = r.read_u32::<BE>()?;
+        let p2 = r.read_u32::<BE>()?;
+        //println!("PACKED {:08x} {:08x} {:08x}", p0, p1, p2);
+        Self::from_packed((p0, p1, p2)).map_err(|e| io::Error::other(e))
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn fg_write(&self, w: &mut dyn Write) -> io::Result<()> {
+        self.fg.fgbg_write(FOREGROUND, w)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn bg_write(&self, w: &mut dyn Write) -> io::Result<()> {
+        self.bg.fgbg_write(BACKGROUND, w)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn fg_bytes(&self) -> Vec<u8> {
+        self.fg.fgbg_bytes(FOREGROUND)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn bg_bytes(&self) -> Vec<u8> {
+        self.bg.fgbg_bytes(BACKGROUND)
+    }
+
+    #[inline]
+    pub fn fg_string(&self) -> String {
+        self.fg.fgbg_string(FOREGROUND)
+    }
+
+    #[inline]
+    pub fn bg_string(&self) -> String {
+        self.bg.fgbg_string(BACKGROUND)
+    }
+
+    #[inline]
+    pub fn as_timecode(&self) -> Option<u32> {
+        self.fg.as_timecode()
+    }
+
+    #[allow(dead_code)]
+    pub fn set_fg_index(&mut self, index: u8) {
+        self.fg = TermColor::from_index(Some(index));
+    }
+
+    #[allow(dead_code)]
+    pub fn set_bg_index(&mut self, index: u8) {
+        self.bg = TermColor::from_index(Some(index));
+    }
+}
 
 fn mk_cell(
     last_fg: &TermColor,
     last_bg: &TermColor,
     last_attr: &EnumSet<TermAttr>,
     numbers: Vec<u8>,
-    codepoint: char
+    codepoint: char,
 ) -> Result<TermCell, Error> {
+    //eprintln!("\nparsed {:?} U+{:X}\n", numbers, codepoint as u32);
+    //eprintln!("last fg({:?}) bg({:?})", last_fg, last_bg);
     let mut iter = numbers.into_iter();
 
     let mut fg: Option<TermColor> = None;
     let mut bg: Option<TermColor> = None;
     let mut attr = last_attr.clone();
+
 
     loop {
         match iter.next() {
@@ -478,6 +757,21 @@ fn mk_cell(
                 40..=47 | 49 | 100..=107 => {
                     bg = Some(TermColor::Basic((number - 40).try_into().unwrap()));
                 },
+                255 => {
+                    let x = iter.next();
+                    let y = iter.next();
+                    let z = iter.next();
+                    if x.is_some() && y.is_some() && z.is_some() {
+                        let t = (x.unwrap() as u32) << 16
+                              | (x.unwrap() as u32) <<  8
+                              | (x.unwrap() as u32)     ;
+
+                        fg = Some(TermColor::TimeCode(t.try_into().unwrap()));
+                        bg = Some(TermColor::TimeCode(t.try_into().unwrap()));
+                    } else {
+                        return Err(Error::ParseTruncated);
+                    }
+                }
                 38 | 48 => {
                     let fgbg = match number {
                         38 => FOREGROUND,
@@ -488,7 +782,7 @@ fn mk_cell(
                     match iter.next() {
                         Some(number) => {
                             let color = match number {
-                                5 => {
+                                2 => {
                                     let r = iter.next();
                                     let g = iter.next();
                                     let b = iter.next();
@@ -499,16 +793,16 @@ fn mk_cell(
                                         return Err(Error::ParseTruncated);
                                     }
                                 },
-                                2 => {
+                                5 => {
                                     match iter.next() {
                                         Some(index) => match index {
                                             16..=255 => TermColor::from_index(Some(index)),
-                                            _ => { return Err(Error::ParseBadCode); },
+                                            _ => { return Err(Error::ParseBadCode { code: index }); },
                                         },
                                         None => { return Err(Error::ParseTruncated); },
                                     }
                                 },
-                                _ => { return Err(Error::ParseBadCode); },
+                                _ => { return Err(Error::ParseBadCode { code: number }); },
                             };
 
                             match fgbg {
@@ -519,18 +813,20 @@ fn mk_cell(
                         None => { return Err(Error::ParseTruncated); },
                     }
                 },
-                _ => { return Err(Error::ParseBadCode); },
+                _ => { return Err(Error::ParseBadCode { code: number }); },
             },
             None => { break; },
         }
     }
 
-    Ok(TermCell {
+    let cell = TermCell {
         fg: fg.unwrap_or_else(|| last_fg.clone()),
         bg: bg.unwrap_or_else(|| last_bg.clone()),
         attr,
         codepoint,
-    })
+    };
+    //eprintln!("{:?}", cell);
+    Ok(cell)
 }
 
 pub fn parse_cells(c: &mut Chars) -> Result<Vec<TermCell>, Error> {
@@ -542,15 +838,22 @@ pub fn parse_cells(c: &mut Chars) -> Result<Vec<TermCell>, Error> {
     loop {
         match parse_ansi(c) {
             Ok(result) => match result {
-                Some((numbers, chr)) => {
-                    if chr == '\x0c' {
-                        println!("START OF FRAME");
-                    } else if chr == '\n' {
-                        println!("END OF LINE");
-                    } else {
-                        /* construct cell */
-                        todo!();
-                    }
+                Some((v, chr)) => {
+                    let numbers: Vec<u8> = match chr {
+                        '\n' | '\x0c' | '\x16' | '\x17' => vec![0],
+                        _ => v,
+                    };
+
+                    let cell = mk_cell(
+                        &last_fg, &last_bg, &last_attr,
+                        numbers, chr
+                    )?;
+
+                    last_fg = cell.fg.clone();
+                    last_bg = cell.bg.clone();
+                    last_attr = cell.attr.clone();
+
+                    cells.push(cell);
                 },
                 None => { break; },
             },
