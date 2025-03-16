@@ -8,7 +8,6 @@ use term::{
     rgb_difference,
     xterm256_index_to_rgb,
     xterm256_nearest,
-    xterm256_threshold,
 };
 
 mod input;
@@ -21,8 +20,6 @@ use std::{
     fs::{self, File},
     io::{self, BufRead, Write, BufWriter},
     path::Path,
-    thread,
-    time::{Duration, Instant},
 };
 
 // crates
@@ -58,10 +55,6 @@ enum Commands {
         #[arg(short, long, value_name = "FILE")]
         input: String,
     },
-    Play {
-        #[arg(short, long, value_name = "FILE")]
-        input: String,
-    },
     Nearest {
     },
 }
@@ -87,8 +80,8 @@ struct SubtitleEntry {
 fn main() {
     let cli = Cli::parse();
 
-    match &cli.command {
-        Some(cmd) => match cmd {
+    if let Some(cmd) = &cli.command {
+        match cmd {
             Commands::Decode { source, delay, .. } => {
                 let _ = decode(source.clone(), *delay, None);
             },
@@ -106,16 +99,12 @@ fn main() {
             Commands::Map { input, .. } => {
                 let _ = map(Input::from_path(input).expect("open failed: {:?}")  );
             },
-            Commands::Play { input, .. } => {
-                let _ = play(Input::from_path(input).expect("open failed: {:?}")  );
-            },
             Commands::Nearest { .. } => {
                 nearest();
             },
             #[allow(unreachable_patterns)]
             _ => todo!(),
-        },
-        None => {},
+        }
     }
 }
 
@@ -126,7 +115,7 @@ fn parse_subtitles(subtitles: Input) -> Vec<SubtitleEntry> {
         match s {
             Ok(s) => {
                 let s = s.trim_end().to_string();
-                if s.len() == 0 { return None; }
+                if s.is_empty() { return None; }
                 if s.starts_with("#") { return None; }
                 Some(s)
             }
@@ -157,22 +146,24 @@ fn should_update(a: &TermColor, b: &TermColor, threshold: f32) -> bool {
     a != b && {
         let a_rgb = a.to_rgb();
         let b_rgb = b.to_rgb();
-        if a_rgb.is_some() && b_rgb.is_some() {
-            rgb_difference(a_rgb.unwrap(), b_rgb.unwrap()) > threshold
-        } else {
-            true
+        if let Some(a_rgb) = a_rgb {
+            if let Some(b_rgb) = b_rgb {
+                return rgb_difference(a_rgb, b_rgb) > threshold;
+            }
         }
+
+        true
     }
 }
 
-fn put_string(rows: &mut Vec<Vec<TermCell>>, r: usize, c: usize, s: &str) {
+fn put_string(rows: &mut [Vec<TermCell>], r: usize, c: usize, s: &str) {
     let mut attr = 0u32;
     let mut state = 0;
     let mut c = c;
     // A crappy HTML parser...
-    for codepoint in s.chars().into_iter() {
+    for codepoint in s.chars() {
         let cc = u32::from(codepoint);
-        match state << 24 | cc {
+        match (state << 24) | cc {
             // tag start
             0x000003c => /* < */ { state = 1; }
             // tag end (open)
@@ -190,7 +181,7 @@ fn put_string(rows: &mut Vec<Vec<TermCell>>, r: usize, c: usize, s: &str) {
             0x3000069 => /* i */ { state = 2; attr &= 0xf7; },
             0x3000075 => /* u */ { state = 2; attr &= 0xef; },
             _ => {
-                let v = attr << 24 | cc;
+                let v = (attr << 24) | cc;
                 rows[r][c] = TermCell::from_packed((0x010000ba, 0x01000010, v)).unwrap();
                 state = 0;
                 c += 1;
@@ -213,13 +204,10 @@ fn encode_frame(
 ) -> io::Result<()> {
     let mut last = TermCell::from_packed((9, 9, 0)).unwrap();
 
-    match subs {
-        Some(subs) => {
-            for ent in *subs {
-                put_string(&mut rows, ent.row, ent.col, &ent.text);
-            }
-        },
-        None => (),
+    if let Some(subs) = subs {
+        for ent in *subs {
+            put_string(&mut rows, ent.row, ent.col, &ent.text);
+        }
     }
 
     for row in rows.into_iter() {
@@ -246,13 +234,13 @@ fn encode_frame(
             if update_attr { e.push(change_attr_string(&last.attr, &cell.attr)); }
             if update_fg { e.push(cell.fg_string()); }
             if update_bg { e.push(cell.bg_string()); }
-            if e.len() > 0 {
+            if !e.is_empty() {
                 write_bytes!(w, b"\x1b[{}m", e.join(";").into_bytes())?;
             }
 
             write_codepoint_ansi(w, cell.codepoint)?;
 
-            last = cell.clone();
+            last = cell;
         }
     }
 
@@ -284,9 +272,7 @@ fn encode(mut reader: Input, subtitles: Option<Input>) -> io::Result<()> {
                 v.push(ent);
             },
             None => {
-                let mut v = Vec::<SubtitleEntry>::new();
-                v.push(ent);
-                sub_map.insert(key, v);
+                sub_map.insert(key, vec![ent]);
             },
         };
     }
@@ -367,16 +353,12 @@ fn decode(
         paths.sort();
         paths
             .into_iter()
-            .map(|p| Input::from_path(p))
+            .map(Input::from_path)
             .collect::<io::Result<Vec<_>>>()?
     } else if let Some(input) = source.input {
-        let mut inputs = Vec::<Input>::new();
-        inputs.push(input.try_into()?);
-        inputs
+        vec![input.try_into()?]
     } else {
-        let mut inputs = Vec::<Input>::new();
-        inputs.push(Input::from_stdin()?);
-        inputs
+        vec![Input::from_stdin()?]
     };
 
     let mut timecode = timecode.unwrap_or(0);
@@ -395,13 +377,13 @@ fn decode(
             }
 
             let cells: Vec<_> = parse_cells(&mut line.chars())
-                .map_err(|e| io::Error::other(e))?
+                .map_err(io::Error::other)?
                 .into_iter()
                 .filter(|item| item.codepoint != '\x17')
                 .collect();
 
             // a line with no cells is probably eof
-            if cells.len() == 0 {
+            if cells.is_empty() {
                 eprintln!("no cells frame {} row {}", frame_count, frame_row);
                 break;
             }
@@ -491,20 +473,22 @@ fn map(mut reader: Input) -> io::Result<()> {
             let ofile = File::create(cell).unwrap();
             //let mut writer = BufWriter::new(ofile);
             let mut writer = ZstdEncoder::new(ofile, 11).unwrap();
-            let mut time = Vec::<u8>::new();
+            let time = vec![
+                // emit syncronize
+                0x0f,
+                (time_ms >> 16) as u8,
+                (time_ms >>  8) as u8,
+                (time_ms      ) as u8,
 
-            // emit frame syncronize
-            time.push(0x0f);
-            time.push((time_ms >> 16) as u8);
-            time.push((time_ms >>  8) as u8);
-            time.push((time_ms >>  0) as u8);
+                0x0f,
+                (time_ms >> 16) as u8,
+                (time_ms >>  8) as u8,
+                (time_ms      ) as u8,
 
-            time.push(0x0f);
-            time.push((time_ms >> 16) as u8);
-            time.push((time_ms >>  8) as u8);
-            time.push((time_ms >>  0) as u8);
+                0, 0, 0, 0x16,
+            ];
 
-            time.append(&mut b"\0\0\0\x16".to_vec());
+            //time.append(&mut b"\0\0\0\x16".to_vec());
 
             let _ = writer.write_all(&time);
 
@@ -537,6 +521,7 @@ fn map(mut reader: Input) -> io::Result<()> {
     }
 }
 
+#[allow(dead_code)]
 fn read_timecode(reader: &mut Input, buf: &mut Vec<u8>) -> io::Result<u64> {
     buf.truncate(0);
     match reader.read_until(0x16, buf) {
@@ -545,7 +530,7 @@ fn read_timecode(reader: &mut Input, buf: &mut Vec<u8>) -> io::Result<u64> {
             buf.truncate(0);
             reader.read_until(0x74/*t*/, buf).unwrap();
             Ok(
-                String::from_utf8_lossy(&buf)
+                String::from_utf8_lossy(buf)
                 .trim_end_matches('t')
                 .to_string()
                 .parse::<u64>()
@@ -554,75 +539,6 @@ fn read_timecode(reader: &mut Input, buf: &mut Vec<u8>) -> io::Result<u64> {
         },
         Err(e) => Err(e),
     }
-}
-
-fn play(mut reader: Input) {
-    let mut w = BufWriter::with_capacity(1<<17, std::io::stdout());
-
-    let mut buf = Vec::<u8>::with_capacity(1<<20); // 1MiB
-
-    let t_start = Instant::now();
-    let mut frame_count = 0usize;
-    let mut dropped = 0usize;
-
-    loop {
-        frame_count += 1;
-        let timecode = read_timecode(&mut reader, &mut buf).unwrap();
-
-        let skip = timecode > 0 && {
-            let then = t_start + Duration::from_millis(timecode/10);
-            let wait = then - Instant::now();
-            if wait > Duration::ZERO {
-                // wait for next frame
-                thread::sleep(wait);
-                false
-            } else {
-                dropped += 1;
-                true
-            }
-        };
-
-        buf.truncate(0);
-        let size = match reader.read_until(0x17, &mut buf) {
-            Ok(size) => {
-                let size = size - 1; // trim ETB
-                buf.truncate(if skip { 0 } else { size });
-                size
-            },
-            Err(e) => {
-                eprintln!("Error: {:?}", e);
-                break;
-            }
-        };
-
-        // timestamp components
-        let t_hh = timecode / (3600 * 1000);
-        let t_mm = (timecode / (60 * 1000)) % 60;
-        let t_ss = (timecode / 1000) % 60;
-        let t_ms = timecode % 1000;
-
-        // status line
-        let status = format!(
-            "  [{:6}][{:6}b][{:02}:{:02}:{:02}.{:03}]",
-            frame_count, size,
-            t_hh, t_mm, t_ss, t_ms,
-        );
-
-        // add status line to buffer
-        buf.write_all(status.as_bytes()).unwrap();
-        if dropped > 0 {
-            write_bytes!(&mut buf, b" Dropped: {}", dropped).unwrap();
-        }
-        buf.write_all(b"\x1b[G").unwrap();
-
-        // output buffer
-        w.write_all(&buf).unwrap();
-
-        // flush
-        let _ = w.flush();
-    }
-
-    w.write_all(b"\n").unwrap();
 }
 
 fn nearest() {

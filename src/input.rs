@@ -47,13 +47,13 @@ impl<'a> Input<'a> {
     pub fn from_reader(mut reader: impl BufRead + 'a, label: &str) -> io::Result<Input<'a>> {
         let buf = reader.fill_buf()?;
 
-        if buf.len() >= 4 && &buf[0..=3] == ZSTD_MAGIC {
+        if buf.len() >= 4 && buf[0..=3] == ZSTD_MAGIC {
             let reader = ZstdDecoder::with_buffer(reader)?;
             let reader = BufReader::new(reader);
             return Ok(Input::new(label, reader));
         }
 
-        if buf.len() >= 3 && &buf[0..=2] == GZIP_MAGIC {
+        if buf.len() >= 3 && buf[0..=2] == GZIP_MAGIC {
             let reader = MultiGzDecoder::new(reader);
             let reader = BufReader::new(reader);
             return Ok(Input::new(label, reader));
@@ -68,13 +68,13 @@ impl<'a> Input<'a> {
     }
 }
 
-impl<'a> Read for Input<'a> {
+impl Read for Input<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.read(buf)
     }
 }
 
-impl<'a> BufRead for Input<'a> {
+impl BufRead for Input<'_> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
         self.inner.fill_buf()
     }
@@ -86,7 +86,7 @@ impl<'a> BufRead for Input<'a> {
 
 macro_rules! input_try_from_path {
     ($t:ty) => {
-        impl<'a> TryFrom<$t> for Input<'a> {
+        impl TryFrom<$t> for Input<'_> {
             type Error = io::Error;
 
             fn try_from(path: $t) -> Result<Self, Self::Error> {

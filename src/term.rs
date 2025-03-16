@@ -1,4 +1,5 @@
 use std::{
+    fmt::{self, Write as _},
     io::{self, Read, Write},
     str::Chars,
     sync::atomic::{AtomicU8, Ordering},
@@ -15,9 +16,11 @@ include!(concat!(env!("OUT_DIR"),"/lut_partial.rs"));
 use palette::{
     Srgb,
     lab::Lab,
-    convert::FromColor,
-    color_difference::Ciede2000,
-    color_difference::ImprovedCiede2000,
+    //oklab::Oklab,
+    // trait imports
+    convert::FromColor as _,
+    //color_difference::EuclideanDistance as _,
+    color_difference::ImprovedCiede2000 as _,
 };
 
 use thiserror::Error as ThisError;
@@ -53,7 +56,7 @@ lazy_static! {
     };
 
     static ref lut_xterm256_lab: Vec<Lab> = {
-        (0u8..=255).into_iter().map(|idx| {
+        (0u8..=255).map(|idx| {
             rgb_to_lab(xterm256_index_to_rgb(idx))
         }).collect::<Vec<_>>()
     };
@@ -138,9 +141,10 @@ pub fn xterm256_exact(r: u8, g: u8, b: u8) -> Option<u8> {
     None
 }
 
+#[allow(dead_code)]
 pub fn xterm256_threshold(r: u8, g: u8, b: u8, threshold: f32) -> Option<u8> {
     // NaN comparisons always fail, so we don't want to use < 0.0
-    if !(threshold >= 0.0) {
+    if !threshold.ge(&0.0) {
         None
     } else if let Some(index) = xterm256_exact(r, g, b) {
         let packed_rgb = pack_rgb(r, g, b);
@@ -149,10 +153,10 @@ pub fn xterm256_threshold(r: u8, g: u8, b: u8, threshold: f32) -> Option<u8> {
     } else {
         let index = xterm256_nearest(r, g, b);
         // biggest difference from nearest is for #002502
-        if threshold > 11.51406 { return index; }
+        if threshold > 11.51406 { return Some(index); }
         let other = lut_xterm256_lab[index as usize];
         let lab = rgb_to_lab((r, g, b));
-        if lab.difference(other) <= threshold {
+        if lab.improved_difference(other) <= threshold {
             Some(index)
         } else {
             None
@@ -189,7 +193,7 @@ pub fn xterm256_nearest(r: u8, g: u8, b: u8) -> u8 {
 
         for &candidate in values.iter() {
             let other = lut_xterm256_lab[candidate as usize];
-            let diff = lab.difference(other);
+            let diff = lab.improved_difference(other);
             if diff < best_diff {
                 best_diff = diff;
                 index = candidate;
@@ -236,7 +240,7 @@ impl TryFrom<u32> for TimeCode {
 
 impl TimeCode {
     fn as_u32(self) -> u32 {
-        self.0 as u32
+        self.0
     }
 }
 
@@ -281,7 +285,7 @@ impl TryFrom<u8> for Basic {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0..=7 | 9 | 60..=67 => Ok(unsafe { std::mem::transmute::<_, Self>(value) }),
+            0..=7 | 9 | 60..=67 => Ok(unsafe { std::mem::transmute::<u8, Basic>(value) }),
             _ => Err(Error::BadIndex16(value)),
         }
     }
@@ -332,7 +336,7 @@ impl TermColor {
             Self::TimeCode { 0: inner } => {
                 match base {
                     30 => format!("\x16{}t", inner.as_u32()),
-                    _ => format!(""),
+                    _ => String::new(),
                 }
             }
         }
@@ -393,7 +397,7 @@ impl TermColor {
             0x02000000..=0x02ffffff => {
                 let r = (packed >> 16) as u8;
                 let g = (packed >>  8) as u8;
-                let b = (packed >>  0) as u8;
+                let b = (packed      ) as u8;
                 Ok(Self::Rgb { r, g, b })
             },
             0x0f000000..=0x0fffffff => {
@@ -404,8 +408,8 @@ impl TermColor {
         }
     }
 
-    pub fn to_packed(&self) -> u32 {
-        match *self {
+    pub fn to_packed(self) -> u32 {
+        match self {
             Self::Rgb { r, g, b } => (2u32 << 24) | (pack_rgb(r, g, b) as u32),
             Self::Xterm256 { 0: inner } => (1u32 << 24) | (inner.0 as u32),
             Self::Basic { 0: inner } => inner as u32,
@@ -421,8 +425,8 @@ impl TermColor {
         }
     }
 
-    pub fn to_rgb(&self) -> Option<(u8, u8, u8)> {
-        match *self {
+    pub fn to_rgb(self) -> Option<(u8, u8, u8)> {
+        match self {
             Self::Rgb { r, g, b } => Some((r, g, b)),
             Self::Xterm256 { 0: inner } => Some(xterm256_index_to_rgb(inner.0)),
             Self::Basic { 0: _ } => None,
@@ -442,8 +446,8 @@ impl TermColor {
     }
 
     #[allow(dead_code)]
-    pub fn to_index(&self) -> Option<u8> {
-        match *self {
+    pub fn to_index(self) -> Option<u8> {
+        match self {
             Self::Rgb { r, g, b } => Some(xterm256_nearest(r, g, b)),
             Self::Xterm256 { 0: inner } => Some(inner.0),
             Self::Basic { 0: inner } => inner.to_index(),
@@ -515,12 +519,12 @@ pub enum TermAttr {
     Underline = 4,
 }
 
-impl ToString for TermAttr {
-    fn to_string(&self) -> String {
+impl fmt::Display for TermAttr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            TermAttr::Bold => "1".to_string(),
-            TermAttr::Italic => "3".to_string(),
-            TermAttr::Underline => "4".to_string(),
+            TermAttr::Bold => f.write_char('1'),
+            TermAttr::Italic => f.write_char('3'),
+            TermAttr::Underline => f.write_char('4'),
         }
     }
 }
@@ -542,14 +546,14 @@ pub fn change_attr_string(old: &EnumSet<TermAttr>, new: &EnumSet<TermAttr>) -> S
     let mut attrs = Vec::<String>::new();
 
     // clear
-    push_attr(&mut attrs, &old, &new, TermAttr::Bold, "22");
-    push_attr(&mut attrs, &old, &new, TermAttr::Italic, "23");
-    push_attr(&mut attrs, &old, &new, TermAttr::Underline, "24");
+    push_attr(&mut attrs, old, new, TermAttr::Bold, "22");
+    push_attr(&mut attrs, old, new, TermAttr::Italic, "23");
+    push_attr(&mut attrs, old, new, TermAttr::Underline, "24");
 
     // set
-    push_attr(&mut attrs, &new, &old, TermAttr::Bold, "1");
-    push_attr(&mut attrs, &new, &old, TermAttr::Italic, "3");
-    push_attr(&mut attrs, &new, &old, TermAttr::Underline, "4");
+    push_attr(&mut attrs, new, old, TermAttr::Bold, "1");
+    push_attr(&mut attrs, new, old, TermAttr::Italic, "3");
+    push_attr(&mut attrs, new, old, TermAttr::Underline, "4");
 
     attrs.join(";")
 }
@@ -607,7 +611,7 @@ pub fn parse_ansi(c: &mut Chars) -> Result<Option<(Vec<u8>, char)>, Error> {
                     numbers.push(255u8);
                     numbers.push((accum >> 16) as u8);
                     numbers.push((accum >>  8) as u8);
-                    numbers.push((accum >>  0) as u8);
+                    numbers.push((accum      ) as u8);
                     accum = 0;
                     state = 0;
                 },
@@ -638,13 +642,13 @@ impl TermCell {
         let bg = TermColor::from_packed(tup.1)?;
         let attr = EnumSet::<TermAttr>::from_u32(tup.2 >> 24);
         let c = tup.2 & 0xffffff;
-        let codepoint = char::from_u32(c).ok_or_else(|| Error::BadCodepoint(c))?;
+        let codepoint = char::from_u32(c).ok_or(Error::BadCodepoint(c))?;
 
         Ok(Self { fg, bg, attr, codepoint })
     }
 
     #[inline]
-    pub fn to_packed(&self) -> (u32, u32, u32) {
+    pub fn to_packed(self) -> (u32, u32, u32) {
         let fg = self.fg.to_packed();
         let bg = self.bg.to_packed();
         let attr = self.attr.as_u32() << 24;
@@ -653,12 +657,12 @@ impl TermCell {
         (fg, bg, codepoint)
     }
 
-    pub fn to_packed_bytes(&self) -> Vec<u8> {
+    pub fn to_packed_bytes(self) -> Vec<u8> {
         let mut bytes = Vec::<u8>::new();
         let packed = self.to_packed();
-        bytes.extend_from_slice(&mut packed.0.to_be_bytes());
-        bytes.extend_from_slice(&mut packed.1.to_be_bytes());
-        bytes.extend_from_slice(&mut packed.2.to_be_bytes());
+        bytes.extend_from_slice(&packed.0.to_be_bytes());
+        bytes.extend_from_slice(&packed.1.to_be_bytes());
+        bytes.extend_from_slice(&packed.2.to_be_bytes());
 
         bytes
     }
@@ -668,7 +672,7 @@ impl TermCell {
         let p1 = r.read_u32::<BE>()?;
         let p2 = r.read_u32::<BE>()?;
         //println!("PACKED {:08x} {:08x} {:08x}", p0, p1, p2);
-        Self::from_packed((p0, p1, p2)).map_err(|e| io::Error::other(e))
+        Self::from_packed((p0, p1, p2)).map_err(io::Error::other)
     }
 
     #[inline]
@@ -734,94 +738,91 @@ fn mk_cell(
 
     let mut fg: Option<TermColor> = None;
     let mut bg: Option<TermColor> = None;
-    let mut attr = last_attr.clone();
+    let mut attr = *last_attr;
 
 
-    loop {
-        match iter.next() {
-            Some(number) => match number {
-                0 => {
-                    fg = Some(TermColor::from_index(None));
-                    bg = Some(TermColor::from_index(None));
-                    attr = enum_set!() as EnumSet<TermAttr>;
-                },
-                1 => { attr.insert(TermAttr::Bold); },
-                22 => { attr.remove(TermAttr::Bold); },
-                3 => { attr.insert(TermAttr::Italic); },
-                23 => { attr.remove(TermAttr::Italic); },
-                4 => { attr.insert(TermAttr::Underline); },
-                24 => { attr.remove(TermAttr::Underline); },
-                30..=37 | 39 | 90..=97 => {
-                    fg = Some(TermColor::Basic((number - 30).try_into().unwrap()));
-                },
-                40..=47 | 49 | 100..=107 => {
-                    bg = Some(TermColor::Basic((number - 40).try_into().unwrap()));
-                },
-                255 => {
-                    let x = iter.next();
-                    let y = iter.next();
-                    let z = iter.next();
-                    if x.is_some() && y.is_some() && z.is_some() {
-                        let t = (x.unwrap() as u32) << 16
-                              | (x.unwrap() as u32) <<  8
-                              | (x.unwrap() as u32)     ;
-
-                        fg = Some(TermColor::TimeCode(t.try_into().unwrap()));
-                        bg = Some(TermColor::TimeCode(t.try_into().unwrap()));
-                    } else {
-                        return Err(Error::ParseTruncated);
-                    }
-                }
-                38 | 48 => {
-                    let fgbg = match number {
-                        38 => FOREGROUND,
-                        48 => BACKGROUND,
-                        _ => unreachable!(),
-                    };
-
-                    match iter.next() {
-                        Some(number) => {
-                            let color = match number {
-                                2 => {
-                                    let r = iter.next();
-                                    let g = iter.next();
-                                    let b = iter.next();
-                                    if r.is_some() && g.is_some() && b.is_some() {
-                                        let rgb = (r.unwrap(), g.unwrap(), b.unwrap());
-                                        TermColor::from_rgb(rgb)
-                                    } else {
-                                        return Err(Error::ParseTruncated);
-                                    }
-                                },
-                                5 => {
-                                    match iter.next() {
-                                        Some(index) => match index {
-                                            16..=255 => TermColor::from_index(Some(index)),
-                                            _ => { return Err(Error::ParseBadCode { code: index }); },
-                                        },
-                                        None => { return Err(Error::ParseTruncated); },
-                                    }
-                                },
-                                _ => { return Err(Error::ParseBadCode { code: number }); },
-                            };
-
-                            match fgbg {
-                                FOREGROUND => { fg = Some(color); },
-                                BACKGROUND => { bg = Some(color); },
-                            }
-                        },
-                        None => { return Err(Error::ParseTruncated); },
-                    }
-                },
-                _ => { return Err(Error::ParseBadCode { code: number }); },
+    while let Some(number) = iter.next() {
+        match number {
+            0 => {
+                fg = Some(TermColor::from_index(None));
+                bg = Some(TermColor::from_index(None));
+                attr = enum_set!() as EnumSet<TermAttr>;
             },
-            None => { break; },
+            1 => { attr.insert(TermAttr::Bold); },
+            22 => { attr.remove(TermAttr::Bold); },
+            3 => { attr.insert(TermAttr::Italic); },
+            23 => { attr.remove(TermAttr::Italic); },
+            4 => { attr.insert(TermAttr::Underline); },
+            24 => { attr.remove(TermAttr::Underline); },
+            30..=37 | 39 | 90..=97 => {
+                fg = Some(TermColor::Basic((number - 30).try_into().unwrap()));
+            },
+            40..=47 | 49 | 100..=107 => {
+                bg = Some(TermColor::Basic((number - 40).try_into().unwrap()));
+            },
+            255 => {
+                let x = iter.next();
+                let y = iter.next();
+                let z = iter.next();
+                if x.is_some() && y.is_some() && z.is_some() {
+                    let t = ((x.unwrap() as u32) << 16)
+                          | ((x.unwrap() as u32) <<  8)
+                          |  (x.unwrap() as u32)      ;
+
+                    fg = Some(TermColor::TimeCode(t.try_into().unwrap()));
+                    bg = Some(TermColor::TimeCode(t.try_into().unwrap()));
+                } else {
+                    return Err(Error::ParseTruncated);
+                }
+            }
+            38 | 48 => {
+                let fgbg = match number {
+                    38 => FOREGROUND,
+                    48 => BACKGROUND,
+                    _ => unreachable!(),
+                };
+
+                match iter.next() {
+                    Some(number) => {
+                        let color = match number {
+                            2 => {
+                                let r = iter.next();
+                                let g = iter.next();
+                                let b = iter.next();
+                                if r.is_some() && g.is_some() && b.is_some() {
+                                    let rgb = (r.unwrap(), g.unwrap(), b.unwrap());
+                                    TermColor::from_rgb(rgb)
+                                } else {
+                                    return Err(Error::ParseTruncated);
+                                }
+                            },
+                            5 => {
+                                match iter.next() {
+                                    Some(index) => match index {
+                                        16..=255 => TermColor::from_index(Some(index)),
+                                        _ => { return Err(Error::ParseBadCode { code: index }); },
+                                    },
+                                    None => { return Err(Error::ParseTruncated); },
+                                }
+                            },
+                            _ => { return Err(Error::ParseBadCode { code: number }); },
+                        };
+
+                        match fgbg {
+                            FOREGROUND => { fg = Some(color); },
+                            BACKGROUND => { bg = Some(color); },
+                        }
+                    },
+                    None => { return Err(Error::ParseTruncated); },
+                }
+            },
+            _ => { return Err(Error::ParseBadCode { code: number }); },
         }
     }
 
     let cell = TermCell {
-        fg: fg.unwrap_or_else(|| last_fg.clone()),
-        bg: bg.unwrap_or_else(|| last_bg.clone()),
+        fg: fg.unwrap_or(*last_fg),
+        bg: bg.unwrap_or(*last_bg),
         attr,
         codepoint,
     };
@@ -849,9 +850,9 @@ pub fn parse_cells(c: &mut Chars) -> Result<Vec<TermCell>, Error> {
                         numbers, chr
                     )?;
 
-                    last_fg = cell.fg.clone();
-                    last_bg = cell.bg.clone();
-                    last_attr = cell.attr.clone();
+                    last_fg = cell.fg;
+                    last_bg = cell.bg;
+                    last_attr = cell.attr;
 
                     cells.push(cell);
                 },

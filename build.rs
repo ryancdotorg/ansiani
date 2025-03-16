@@ -10,8 +10,6 @@ use std::{
 
 use atomic_counter::{AtomicCounter, RelaxedCounter};
 
-use blake3;
-
 use counter::Counter;
 
 use itertools::iproduct;
@@ -19,8 +17,11 @@ use itertools::iproduct;
 use palette::{
     Srgb,
     lab::Lab,
-    convert::FromColor,
-    color_difference::Ciede2000,
+    //oklab::Oklab,
+    // trait imports
+    convert::FromColor as _,
+    //color_difference::EuclideanDistance as _,
+    color_difference::ImprovedCiede2000 as _,
 };
 
 use rayon::prelude::*;
@@ -41,7 +42,7 @@ fn sorted<T>(slice: &[T]) -> Vec<T> where T: Clone + Ord {
 }
 
 fn b3(data: &[u8]) -> String {
-    blake3::hash(&data).to_hex().to_string()
+    blake3::hash(data).to_hex().to_string()
 }
 
 fn rgb_to_lab(rgb: (u8, u8, u8)) -> Lab {
@@ -63,7 +64,7 @@ fn xterm256_rgb_approx(level: u8) -> u8 {
     // levels are (0, 95, 135, 175, 215, 255)
     match level {
         0..=47 => 0, 48..=114 => 1,
-        _ => ((level - 35) / 40) as u8,
+        _ => (level - 35) / 40,
     }
 }
 
@@ -114,7 +115,7 @@ fn xterm256_index_to_rgb(index: u8) -> (u8, u8, u8) {
             (
                 level(((index - 16) / 36) % 6),
                 level(((index - 16) /  6) % 6),
-                level(((index - 16) /  1) % 6),
+                level(( index - 16      ) % 6),
             )
         },
         // xterm 256 grey scale
@@ -129,12 +130,12 @@ fn xterm256_index_to_rgb(index: u8) -> (u8, u8, u8) {
 /// Generate the Xterm256 palette.
 fn gen_xterm256_lut_rgb<F>(
     write: &mut F,
-    xterm256_rgb: &Vec<(u8, (u8, u8, u8))>
+    xterm256_rgb: &[(u8, (u8, u8, u8))]
 )
 where
-    F: FnMut(&str) -> (),
+    F: FnMut(&str),
 {
-    write("const LUT_PALETTE: [(u8, u8, u8); 240] = [\n");
+    write("static LUT_PALETTE: [(u8, u8, u8); 240] = [\n");
     for &(index, (r, g, b)) in xterm256_rgb.iter() {
         write(&format!("    ({:3}, {:3}, {:3}),", r, g, b));
         if index == 255 || index % 4 == 3 { write("\n"); }
@@ -145,13 +146,13 @@ where
 /// Pre-compute nearest Xterm256 palette entry for all 24-bit RGB colors.
 fn gen_xterm256_lut_nearest<F>(
     status: &mut F,
-    xterm256_rgb: &Vec<(u8, (u8, u8, u8))>
+    xterm256_rgb: &[(u8, (u8, u8, u8))]
 ) -> Vec<u8>
 where
-    F: FnMut(&str) -> () + Sync + Send,
+    F: FnMut(&str) + Sync + Send,
 {
     // try to use a cached version
-    let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").unwrap();
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let nearest_bin_path = Path::new(&manifest_dir).join(".nearest.zst");
     if let Ok(file) = File::open(&nearest_bin_path) {
         let mut reader = ZstdDecoder::new(file).unwrap();
@@ -160,6 +161,18 @@ where
             return lut_nearest;
         }
     }
+
+    /*
+    let opt_level = env::var("OPT_LEVEL").unwrap();
+
+    println!("cargo:warning=OPT_LEVEL={opt_level}");
+    println!("cargo:warning=OPT_LEVEL={opt_level}");
+    println!("cargo:warning=Hello?");
+
+    if opt_level == "0" {
+        panic!("nope!");
+    }
+    */
 
     // pre-generate lab colors
     let xterm256_lab: Vec::<(u8, Lab)> = xterm256_rgb.iter().map(
@@ -177,7 +190,7 @@ where
         let approx = xterm256_index_approx(r, g, b);
 
         for (index, other) in approx.iter().map(|i| &xterm256_lab[*i as usize - 16]) {
-            let diff = lab.difference(*other);
+            let diff = lab.improved_difference(*other);
             if diff < best_diff {
                 best_diff = diff;
                 best_index = *index;
@@ -189,7 +202,7 @@ where
 
     let m_status = Mutex::new(status);
     m_status.lock().unwrap()(
-        "\x1b[G\x1b[K \x1b[1;35mCalculating\x1b[0m CIEDE2000 Differences: \x1b[s  0.0%"
+        "\x1b[G\x1b[K \x1b[1;35mCalculating\x1b[0m CIEDE2000 Improved Differences: \x1b[s  0.0%"
     );
 
     // find best matches in parallel
@@ -199,7 +212,7 @@ where
         (0..n).into_par_iter().map(|color| {
             let r = ((color >> 16) & 255) as u8;
             let g = ((color >>  8) & 255) as u8;
-            let b = ((color >>  0) & 255) as u8;
+            let b = ((color      ) & 255) as u8;
 
             let index = best_index(r, g, b);
 
@@ -234,12 +247,12 @@ where
 fn gen_xterm256_lut_partial<F, G>(
     write: &mut F,
     status: &mut G,
-    lut_nearest: &Vec<u8>,
+    lut_nearest: &[u8],
     r_bits: u8, g_bits: u8, b_bits: u8
 )
 where
-    F: FnMut(&str) -> (),
-    G: FnMut(&str) -> () + Sync + Send,
+    F: FnMut(&str),
+    G: FnMut(&str) + Sync + Send,
 {
     // Chunk iterators
     let r_mins = (0u8..=255).step_by(1 << (8 - r_bits));
@@ -346,12 +359,12 @@ where
             if curr_progress > last_progress {
                 m_status.lock().unwrap()(&format!(
                     "\x1b[u\x1b[K{:5.1}%",
-                    curr_progress as f64 / 10.0,
+                    curr_progress / 10.0,
                 ));
             }
         }
 
-        return n;
+        n
     }).collect::<Counter<_>>();
 
     let total_entries = freq.iter().fold(0, |t, (&k, v)| t + (k as usize) * v);
@@ -382,7 +395,7 @@ where
         b_bits, 0,
     ));
 
-    write(&format!("const LUT_OFFSETS: [u16; {}] = [\n", lut_offsets.len()));
+    write(&format!("static LUT_OFFSETS: [u16; {}] = [\n", lut_offsets.len()));
 
     for (i, v) in lut_offsets.iter().enumerate() {
         if i % 11 == 0 { write("   "); }
@@ -409,15 +422,15 @@ where
     write("];\n");
 }
 
-fn mk_write(name: &str) -> Result<impl FnMut(&str) -> (), std::io::Error> {
-    let out_dir = env::var_os("OUT_DIR").unwrap();
+fn mk_write(name: &str) -> Result<impl FnMut(&str), std::io::Error> {
+    let out_dir = env::var("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join(name);
     let file = File::create(dest_path)?;
     let mut writer = BufWriter::new(file);
     Ok(move |s: &str| writer.write_all(s.as_bytes()).unwrap())
 }
 
-fn mk_status() -> Box<dyn FnMut(&str) -> () + Sync + Send> {
+fn mk_status() -> Box<dyn FnMut(&str) + Sync + Send> {
     match File::options().write(true).open("/dev/tty") {
         Ok(mut f) => Box::new(move |s: &str| f.write_all(s.as_bytes()).unwrap()),
         Err(_) => Box::new(|_s: &str| ()),
@@ -438,11 +451,12 @@ fn main() {
     let lut_nearest = gen_xterm256_lut_nearest(&mut status, &xterm256_rgb);
 
     let mut write = mk_write("lut_partial.rs").unwrap();
-    write(&format!("#[allow(dead_code)]\n"));
+    write("#[allow(dead_code)]\n");
     write(&format!("const NEAREST_BLAKE3: &str = \"{}\";\n", b3(&lut_nearest)));
 
     gen_xterm256_lut_partial(&mut write, &mut status, &lut_nearest, 5, 5, 4);
     status("\x1b[2K\x1b[F");
 
     println!("cargo::rerun-if-changed=build.rs");
+    println!("cargo::rerun-if-changed=.nearest.zst");
 }
