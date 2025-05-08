@@ -13,11 +13,11 @@ clap = { version = "4", features = ["derive"] }
 enumset = "1.1"
 flate2 = "1.0"
 format-bytes = "0.3"
-itertools = "0.13"
+itertools = "0.14"
 lazy_static = "1.5"
 palette = "0.7"
 rayon = "1.10"
-thiserror = "1.0"
+thiserror = "2.0"
 zstd = "0.13"
 #lru = "0"
 #bimap = "0"
@@ -25,15 +25,15 @@ zstd = "0.13"
 [build-dependencies]
 atomic-counter = "1.0"
 blake3 = "1.5"
-counter = "0.5"
-itertools = "0.13"
+counter = "0.6"
+itertools = "0.14"
 rayon = "1.10"
 palette = "0.7"
 zstd = "0.13"
 
 # build.rs does expensive lookup table generation
-[profile.dev.build-override]
-opt-level = 3
+#[profile.dev.build-override]
+#opt-level = 1
 
 [profile.release.build-override]
 opt-level = 3
